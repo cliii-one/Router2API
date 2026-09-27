@@ -1,11 +1,32 @@
 #!/bin/bash
-# 安装后初始化：准备数据目录并统一文件权限
-# 注意：不在这里启动服务，也不打印凭据（启动由框架随后调用 cmd/main start）
+# 安装后初始化：准备数据目录、统一权限，并顺带检查包体完整性。
+#
+# ⚠️ 关于两个 install 脚本的分工（踩过坑，务必看清）：
+#   install_init     —— 安装"前"执行。此时 app.tgz 还没解压到 target，
+#                       ${TRIM_APPDEST} 下是空的，**绝不能**检查包内文件，
+#                       否则会把正常安装直接中止掉。
+#   install_callback —— 安装"后"执行，文件理论上已就位，可以检查。
+#
+#   即便在 callback 里，包体检查也只**告警不中止**：
+#   不同飞牛版本的解压时序可能不同，宁可在启动阶段给出明确错误
+#   （cmd/main start 里有同样的检查），也不要冒"装不上"的风险。
 
 set -u
 
 APPDEST="${TRIM_APPDEST:-}"
 PKGVAR="${TRIM_PKGVAR:-}"
+
+warn() {
+    echo "$1" >&2
+    [ -n "${TRIM_TEMP_LOGFILE:-}" ] && echo "$1" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    return 0
+}
+
+# 包体完整性：只告警，不中止安装
+[ -f "${APPDEST}/host/Router.Host.dll" ] \
+    || warn "⚠ 未找到主程序（${APPDEST}/host/Router.Host.dll），若启动失败请重新下载 fpk。"
+[ -f "${APPDEST}/redis/redis-server" ] \
+    || warn "⚠ 未找到 Redis 组件，若启动失败请重新下载 fpk。"
 
 # 运行时目录：数据库、日志、Redis 数据、配置
 # 注意：Config 放在 var 而不是 target —— 上游按工作目录读 Config/Config.json，
@@ -15,18 +36,9 @@ mkdir -p "${PKGVAR}/plugins/.subscription" 2>/dev/null || true
 chmod 755 "${PKGVAR}" "${PKGVAR}/data" "${PKGVAR}/logs" "${PKGVAR}/redis" 2>/dev/null || true
 chmod 755 "${PKGVAR}/Config" "${PKGVAR}/plugins" 2>/dev/null || true
 
-# 兼容处理：若包内或旧版本在 target 下留了 Config，迁移到 var 后移除
-if [ -d "${APPDEST}/Config" ] && [ ! -L "${APPDEST}/Config" ]; then
-    if [ -z "$(ls -A "${PKGVAR}/Config" 2>/dev/null)" ]; then
-        cp -a "${APPDEST}/Config/." "${PKGVAR}/Config/" 2>/dev/null || true
-    fi
-    rm -rf "${APPDEST}/Config" 2>/dev/null || true
-fi
-
 # 保证可执行位没在打包/解包过程中丢失
-chmod 755 "${APPDEST}/cmd/main" 2>/dev/null || true
 chmod 755 "${APPDEST}/cmd/"* 2>/dev/null || true
-chmod 755 "${APPDEST}/redis/redis-server" 2>/dev/null || true
+chmod 755 "${APPDEST}/redis/redis-server" "${APPDEST}/redis/redis-cli" 2>/dev/null || true
 chmod 755 "${APPDEST}/host/Router.Host" 2>/dev/null || true
 
 exit 0

@@ -37,8 +37,8 @@ Router2API/
 │   ├── manifest                   # 应用元数据（名称、版本、端口、入口）
 │   ├── cmd/                       # 9 个生命周期脚本（少了 fnpack 会拒绝打包）
 │   │   ├── main                   # ★ 核心：启停 Redis 与 .NET 宿主
-│   │   ├── install_init           # 安装前：检查包体完整性与端口占用
-│   │   ├── install_callback       # 安装后：建目录、修权限
+│   │   ├── install_init           # 安装前：只做端口预检（此时文件还没解压！）
+│   │   ├── install_callback       # 安装后：查包体、建目录、修权限
 │   │   ├── upgrade_init/_callback # 升级前后
 │   │   ├── uninstall_init/_callback
 │   │   └── config_init/_callback  # 应用设置里改配置时

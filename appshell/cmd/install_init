@@ -1,23 +1,12 @@
 #!/bin/bash
-# 安装前检查：确认端口可用、包体完整
-# 出错时写入 TRIM_TEMP_LOGFILE，安装界面会展示给用户
+# 安装前检查：只做端口占用预检。
+#
+# ⚠️ 注意时机：本脚本在"安装前"执行，此时 app.tgz 还没解压到 target，
+#    ${TRIM_APPDEST} 下是空的（或仅有空目录）。
+#    所以这里**不能**检查主程序/Redis 是否存在——那必然失败并把安装中止。
+#    包体完整性检查放在 install_callback（安装后，文件已就位）。
 
 set -u
-
-APPDEST="${TRIM_APPDEST:-}"
-PKGVAR="${TRIM_PKGVAR:-}"
-
-fail() {
-    echo "$1" >&2
-    [ -n "${TRIM_TEMP_LOGFILE:-}" ] && echo "$1" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
-    exit 1
-}
-
-[ -n "${APPDEST}" ] || fail "✗ 安装环境异常：未获取到应用目录（TRIM_APPDEST）"
-
-# 包体完整性：主程序与 Redis 必须存在
-[ -f "${APPDEST}/host/Router.Host.dll" ] || fail "✗ 安装包不完整：缺少主程序，请重新下载 fpk。"
-[ -x "${APPDEST}/redis/redis-server" ] || fail "✗ 安装包不完整：缺少 Redis 组件，请重新下载 fpk。"
 
 # 端口占用预检：向导端口若已被占用，提前告知，避免装完打不开
 PORT="${wizard_port:-${TRIM_SERVICE_PORT:-5242}}"
@@ -27,7 +16,10 @@ esac
 
 if command -v ss >/dev/null 2>&1; then
     if ss -tln 2>/dev/null | grep -qE ":${PORT}[[:space:]]"; then
-        fail "✗ 端口 ${PORT} 已被占用，请在安装向导中更换端口。"
+        MSG="✗ 端口 ${PORT} 已被占用，请在安装向导中更换端口。"
+        echo "${MSG}" >&2
+        [ -n "${TRIM_TEMP_LOGFILE:-}" ] && echo "${MSG}" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+        exit 1
     fi
 fi
 
