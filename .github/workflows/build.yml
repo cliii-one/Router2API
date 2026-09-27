@@ -50,6 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      commit: ${{ steps.ver.outputs.commit }}
       skip: ${{ steps.check.outputs.skip }}
     steps:
       - name: Checkout 上游 Router2API（读取版本号）
@@ -58,20 +59,48 @@ jobs:
           repository: NNNNolan/Router2API
           ref: ${{ inputs.upstream_ref || 'main' }}
           path: upstream
-          fetch-depth: 1
+          # 必须拉取 tags：飞牛应用的版本号取自源码仓库的 git tag，与源码仓库
+          # 发布版本严格一致，无需手动维护。（上游 csproj 里的 <Version> 经常
+          # 忘记更新——实测 tag 已到 v2.0.3 而 csproj 仍是 2.0.0，所以以 tag 为准）
+          fetch-depth: 0
 
       - name: 读取上游版本号
         id: ver
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
         run: |
-          # 上游把版本号声明在 Router.Contracts.csproj 的 <Version> 里。
-          # 若上游改成别的写法，这里会回退到日期版本，保证构建不中断。
-          VERSION=$(grep -oPm1 '(?<=<Version>)[^<]+' upstream/src/Router.Contracts/Router.Contracts.csproj || true)
+          # ---------------------------------------------------------
+          # 版本号优先级（与源码仓库保持一致，全自动）：
+          #   1. 构建的 ref 本身是 tag（如 v2.0.3） → 直接用该 tag
+          #   2. 构建分支 → 取该分支可达的最新 tag（git describe --tags）
+          #      例：main 已发布 v2.0.3 → 得到 2.0.3
+          #   3. 一个 tag 都拿不到 → 退回 csproj 的 <Version>
+          #   4. 再兜底用日期，保证构建不中断
+          # ---------------------------------------------------------
+          VERSION=""
+          if [ "${UPSTREAM_REF#v}" != "${UPSTREAM_REF}" ]; then
+            if git -C upstream rev-parse --verify --quiet "refs/tags/${UPSTREAM_REF}^{commit}" >/dev/null 2>&1; then
+              VERSION="${UPSTREAM_REF#v}"
+            fi
+          fi
           if [ -z "${VERSION}" ]; then
-            echo "::warning::未能从 csproj 读取版本号，回退到日期版本"
+            DESC=$(git -C upstream describe --tags --match 'v*' 2>/dev/null || true)
+            # 只保留发布版本号：v2.0.3-14-gabc1234 → v2.0.3
+            VERSION=${DESC%%-*}
+            VERSION=${VERSION#v}
+          fi
+          if [ -z "${VERSION}" ]; then
+            VERSION=$(grep -oPm1 '(?<=<Version>)[^<]+' upstream/src/Router.Contracts/Router.Contracts.csproj || true)
+            echo "::warning::未能从 git tag 读取版本号，回退到 csproj 的 <Version>"
+          fi
+          if [ -z "${VERSION}" ]; then
+            echo "::warning::连 csproj 都没有版本号，回退到日期版本"
             VERSION="0.0.$(date -u +%Y%m%d)"
           fi
+          COMMIT=$(git -C upstream rev-parse --short HEAD)
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "上游版本: ${VERSION}"
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          echo "上游版本: v${VERSION} (commit ${COMMIT}, ref=${UPSTREAM_REF})"
 
       - name: 判断是否需要构建
         id: check
@@ -119,7 +148,7 @@ jobs:
           repository: NNNNolan/Router2API
           ref: ${{ inputs.upstream_ref || 'main' }}
           path: upstream
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: 安装 .NET 10 SDK
         uses: actions/setup-dotnet@v4
@@ -237,7 +266,7 @@ jobs:
           Router2API v${VERSION} 飞牛 fnOS 原生应用包（非 Docker）。
 
           **上游项目**：https://github.com/NNNNolan/Router2API
-          **本次基于上游版本**：v${VERSION}
+          **本次基于上游版本**：v${VERSION}（commit ${{ needs.prepare.outputs.commit }}）
 
           ## 安装方式
 
