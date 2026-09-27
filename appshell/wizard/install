@@ -20,7 +20,7 @@
     ]
   },
   {
-    "stepTitle": "管理后台凭据",
+    "stepTitle": "管理后台登录",
     "items": [
       {
         "type": "text",
@@ -35,14 +35,14 @@
         "type": "password",
         "field": "wizard_admin_password",
         "label": "管理员密码",
+        "initValue": "admin",
         "rules": [
-          { "required": true, "message": "请输入管理员密码" },
-          { "min": 8, "message": "密码至少 8 位" }
+          { "required": true, "message": "请输入管理员密码" }
         ]
       },
       {
         "type": "tips",
-        "helpText": "用于登录管理后台。Router2API 不提供默认密码，请务必设置一个只有你知道的密码。"
+        "helpText": "默认账号密码都是 admin。这是弱密码，仅适合内网使用，登录后请立刻在管理后台「设置」页修改。"
       }
     ]
   },

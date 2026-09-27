@@ -156,10 +156,11 @@ start_redis() {
     local redis_dir="${PKGVAR}/redis"
     mkdir -p "${redis_dir}" 2>/dev/null || true
 
-    # 二进制依赖 liblzf（Debian 的 redis 打包于此），跟随包一起发布
-    export LD_LIBRARY_PATH="${REDIS_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-
-    "${REDIS_BIN}" \
+    # Redis 的动态依赖（liblzf、libjemalloc）随包发布在 redis/lib 下。
+    # 用 env 只给这一条命令加上 LD_LIBRARY_PATH，不 export 出去——
+    # 否则会污染脚本后续调用的其它程序，可能引发难查的加载问题。
+    env LD_LIBRARY_PATH="${REDIS_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+        "${REDIS_BIN}" \
         --port "${REDIS_PORT}" \
         --bind 127.0.0.1 \
         --protected-mode yes \
@@ -181,7 +182,12 @@ start_redis() {
         if ! is_alive "${pid}"; then
             log_msg "ERROR: Redis exited early"
             rm -f "${REDIS_PID_FILE}"
-            user_error "✗ Redis 启动失败，请查看日志 ${REDIS_LOG}"
+            # 缺依赖库时给出明确指引（日志里能看到 cannot open shared object file）
+            if grep -q "cannot open shared object file" "${REDIS_LOG}" 2>/dev/null; then
+                user_error "✗ Redis 依赖库缺失，安装包可能不完整或被改动，请重新安装。"
+            else
+                user_error "✗ Redis 启动失败，请查看日志 ${REDIS_LOG}"
+            fi
             return 1
         fi
         if redis_ping; then
@@ -263,6 +269,9 @@ config_file_path() {
 }
 
 # 首次安装建配置；已有配置则只在向导提供了新凭据时更新凭据
+#
+# 首次安装的账号密码固定为 admin / admin，方便装完直接登录。
+# 注意：这是弱密码，仅适合内网使用；登录后请立刻在管理后台改掉。
 ensure_config() {
     local cfg_dir="${WORK_DIR}/Config"
     local cfg_file
@@ -270,20 +279,14 @@ ensure_config() {
     mkdir -p "${cfg_dir}" 2>/dev/null || true
 
     local admin_user="${wizard_admin_username:-admin}"
-    local admin_pass="${wizard_admin_password:-}"
+    local admin_pass="${wizard_admin_password:-admin}"
     local api_key="${wizard_api_key:-}"
 
     # 没有新凭据要写：仅保证文件存在，其余交给 sync_derived_config
-    if [ -f "${cfg_file}" ] && [ -z "${admin_pass}" ] && [ -z "${wizard_admin_username:-}" ] && [ -z "${api_key}" ]; then
+    if [ -f "${cfg_file}" ] && [ -z "${wizard_admin_password:-}" ] \
+       && [ -z "${wizard_admin_username:-}" ] && [ -z "${api_key}" ]; then
         log_msg "Existing Config.json kept (no new credentials from wizard)"
         return 0
-    fi
-
-    # 首次安装且没给密码：生成随机强密码，避免空密码无法登录
-    local generated_password=""
-    if [ ! -f "${cfg_file}" ] && [ -z "${admin_pass}" ]; then
-        admin_pass=$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')
-        generated_password="${admin_pass}"
     fi
 
     # 首次安装且没给 API Key：按上游格式生成 sk-router- + 48 位十六进制
@@ -296,12 +299,6 @@ ensure_config() {
         return 1
     fi
     chmod 600 "${cfg_file}" 2>/dev/null || true
-
-    # 随机生成的初始凭据单独存一份，方便用户在文件管理里查看
-    # 文件名用 ASCII，避免个别安装器对非 ASCII 文件名处理异常
-    if [ -n "${generated_password}" ]; then
-        write_initial_credentials "${admin_user}" "${generated_password}" "${api_key}"
-    fi
 
     log_msg "Config.json written (admin=${admin_user}, redis=127.0.0.1:${REDIS_PORT})"
     return 0
@@ -453,24 +450,6 @@ PYEOF
         log_msg "WARN: derived config sync failed"
     fi
     return 0
-}
-
-# 把随机生成的初始凭据写到 var 下，方便用户查看
-write_initial_credentials() {
-    local user="$1" pass="$2" key="$3"
-    local cred_file="${PKGVAR}/initial-credentials.txt"
-    {
-        echo "Router2API 初始登录凭据（首次安装自动生成）"
-        echo "生成时间: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "管理后台: http://<NAS地址>:${SERVICE_PORT}/"
-        echo "管理员账号: ${user}"
-        echo "管理员密码: ${pass}"
-        echo "下游 API Key: ${key}"
-        echo
-        echo "建议登录管理后台后立即修改密码，并删除本文件。"
-    } > "${cred_file}" 2>/dev/null || true
-    chmod 600 "${cred_file}" 2>/dev/null || true
-    log_msg "Initial credentials written to ${cred_file}"
 }
 
 # =============================================================

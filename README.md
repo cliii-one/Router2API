@@ -86,6 +86,11 @@ git push -u origin main
 
 装好后点桌面 Router2API 图标，或浏览器打开 `http://<NAS地址>:<你设置的端口>/`。
 
+**默认登录账号密码都是 `admin`。** 这是弱密码，只适合内网，登录后请立刻在「设置」页改掉。
+
+> 如果升级时忘了密码：升级向导里密码留空表示"保持不变"；
+> 真要重置，删掉 `<var>/Config/Config.json` 重启，会重新生成 admin/admin。
+
 ## 架构说明
 
 ```mermaid
@@ -126,7 +131,7 @@ flowchart TD
 | 启动失败：Redis 启动失败 | 看 `<var>/logs/redis.log`；确认架构匹配（arm64/x86 别装错） |
 | 端口被占用 | 应用设置里换端口，或在飞牛里查谁占了端口 |
 | 页面打开空白 | 确认 `cmd/main status` 是运行中；看日志有没有异常 |
-| 忘了管理员密码 | 删掉 `<var>/Config/Config.json` 重启，会按向导重新生成 |
+| 忘了管理员密码 | 删掉 `<var>/Config/Config.json` 重启，会重置为默认 admin/admin |
 | 想重置 API Key | 管理后台「设置」页可查看与重置 |
 
 ## 授权

@@ -130,14 +130,21 @@ log "    宿主发布完成：$(du -sh "${APP_CONTENT}/host" | cut -f1)"
 #   而 Debian 13(trixie) 编译的 8.x 需要 GLIBC_2.38 → 报错无法运行 ❌
 #   所以不放任"取最新版"，直接钉死这个已验证可用的版本。
 #
-# 关于两个 Debian 包的细节（都是实测踩出来的）：
+# 关于这几个 Debian 包的细节（都是实测踩出来的）：
 #   1. 实体二进制在 redis-tools 里，不在 redis-server 包里。
 #      redis-server 包的 /usr/bin/redis-server 只是指向 redis-check-rdb 的软链。
-#   2. liblzf.so.1 是 Redis 的 LZF 压缩依赖，飞牛系统本身不带，必须一起打包。
+#   2. liblzf.so.1（LZF 压缩）和 libjemalloc.so.2（内存分配器）都是 Redis 的
+#      动态依赖，但**不能假设目标机器上有**：
+#        - liblzf：飞牛系统本身不带
+#        - libjemalloc：飞牛自带，但 CI 的 Ubuntu runner 上没有，
+#          所以打包时校验会失败（这就是当初 CI 报
+#          `libjemalloc.so.2: cannot open shared object file` 的原因）
+#      两个都随包携带，才能保证在任何机器上都能打包、在飞牛上都能运行。
 #
 # Debian 池路径按包名首字母分子目录，redis 在 r/redis 下。
 REDIS_VERSION="7.0.15-1~deb12u7"
 LZF_VERSION="3.6-4+b4"
+JEMALLOC_VERSION="5.3.0-3"
 DEB_POOL="${DEB_POOL:-https://deb.debian.org/debian/pool/main}"
 
 log "[5/6] 内置 Redis ${REDIS_VERSION}（${DEB_ARCH}）"
@@ -159,18 +166,20 @@ fetch_deb() {
 WORK_DEB="$(mktemp -d)"
 fetch_deb "r/redis" "redis-tools_${REDIS_VERSION}_${DEB_ARCH}.deb" "${WORK_DEB}/x1" "redis-tools"
 fetch_deb "libl/liblzf" "liblzf1_${LZF_VERSION}_${DEB_ARCH}.deb" "${WORK_DEB}/x2" "liblzf"
+fetch_deb "j/jemalloc" "libjemalloc2_${JEMALLOC_VERSION}_${DEB_ARCH}.deb" "${WORK_DEB}/x3" "libjemalloc2"
 
 # redis-server 是 redis-check-rdb 的多调用别名（按 argv[0] 决定行为）
 cp "${WORK_DEB}/x1/usr/bin/redis-check-rdb" "${REDIS_DIR}/redis-server"
 cp "${WORK_DEB}/x1/usr/bin/redis-cli" "${REDIS_DIR}/redis-cli"
 chmod 755 "${REDIS_DIR}/redis-server" "${REDIS_DIR}/redis-cli"
-# liblzf 放到包内 lib 目录，启动脚本用 LD_LIBRARY_PATH 指向它
+# 依赖库统一放包内 lib 目录，启动脚本用 LD_LIBRARY_PATH 指向它
 cp -P "${WORK_DEB}/x2/usr/lib/"*"/liblzf.so.1"* "${REDIS_DIR}/lib/"
+cp -P "${WORK_DEB}/x3/usr/lib/"*"/libjemalloc.so.2"* "${REDIS_DIR}/lib/"
 rm -rf "${WORK_DEB}"
 
-# 实测校验：真跑一次，确认在当前系统能执行（GLIBC 兼容）
+# 实测校验：真跑一次，确认在当前系统能执行（依赖齐全 + GLIBC 兼容）
 if ! LD_LIBRARY_PATH="${REDIS_DIR}/lib" "${REDIS_DIR}/redis-server" --version >/dev/null 2>&1; then
-    echo "FATAL: Redis 二进制无法执行，检查 GLIBC 兼容性" >&2
+    echo "FATAL: Redis 二进制无法执行，检查依赖库与 GLIBC 兼容性" >&2
     LD_LIBRARY_PATH="${REDIS_DIR}/lib" "${REDIS_DIR}/redis-server" --version 2>&1 | head -3 >&2
     exit 1
 fi
@@ -183,10 +192,11 @@ Redis 二进制随 Router2API 应用包一同分发，仅在本应用内使用�
 来源：Debian bookworm 软件包，通过 dpkg-deb 提取
       - redis-tools_${REDIS_VERSION}_${DEB_ARCH}.deb
       - liblzf1_${LZF_VERSION}_${DEB_ARCH}.deb
+      - libjemalloc2_${JEMALLOC_VERSION}_${DEB_ARCH}.deb
 用途：Router2API 宿主需要 Redis 提供插件共享状态、任务锁与代理池冷却策略。
 说明：redis-server 由 redis-tools 的 redis-check-rdb 改名而来（多调用二进制）。
-      lib/ 目录下的 liblzf.so.1 为 Redis 的压缩依赖，启动脚本会设置
-      LD_LIBRARY_PATH 指向该目录。
+      lib/ 目录下是 Redis 的动态依赖（liblzf.so.1 压缩、libjemalloc.so.2 内存分配器），
+      启动脚本会设置 LD_LIBRARY_PATH 指向该目录，不依赖系统是否自带。
 
 版本：固定 7.0.15。飞牛基于 Debian 12（GLIBC 2.36），该版本最高需要 GLIBC_2.34
       可用；Debian 13(trixie) 编译的 8.x 需要 GLIBC_2.38，装上无法运行。
@@ -263,6 +273,8 @@ check_file "${APP_CONTENT}/host/appsettings.json"
 check_file "${APP_CONTENT}/host/wwwroot/index.html"
 check_file "${APP_CONTENT}/redis/redis-server"
 check_file "${APP_CONTENT}/redis/redis-cli"
+check_file "${APP_CONTENT}/redis/lib/liblzf.so.1"
+check_file "${APP_CONTENT}/redis/lib/libjemalloc.so.2"
 check_file "${APP_CONTENT}/ui/config"
 check_file "${APP_PKG}/wizard/install"
 check_file "${APP_PKG}/config/privilege"

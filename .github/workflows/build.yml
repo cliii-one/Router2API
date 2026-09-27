@@ -182,7 +182,8 @@ jobs:
                      stage/Router2API/app/host/Router.Host.dll \
                      stage/Router2API/app/host/wwwroot/index.html \
                      stage/Router2API/app/redis/redis-server \
-                     stage/Router2API/app/redis/lib/liblzf.so.1; do
+                     stage/Router2API/app/redis/lib/liblzf.so.1 \
+                     stage/Router2API/app/redis/lib/libjemalloc.so.2; do
               if [ -e "${f}" ]; then echo "  OK   ${f}"; else echo "  缺失 ${f}"; fi
             done
             echo
@@ -247,6 +248,14 @@ jobs:
           3. 安装向导中设置端口、管理员账号密码、API Key
           4. 装好后点桌面 Router2API 图标，或浏览器访问 \`http://<NAS地址>:<端口>/\`
 
+          ## 默认登录
+
+          - 管理后台地址：\`http://<NAS地址>:<端口>/\`
+          - 默认账号：\`admin\`
+          - 默认密码：\`admin\`
+
+          > 默认密码是弱密码，**仅适合内网**。登录后请立刻在「设置」页修改。
+
           ## 特性
 
           - **非 Docker**：.NET 10 自包含发布 + 包内自带 Redis，不依赖任何运行时
@@ -255,14 +264,13 @@ jobs:
 
           ## 升级说明
 
-          直接覆盖安装即可，管理员密码、API Key、数据库与已装插件都会保留。
+          直接覆盖安装即可，管理员密码、API Key、数据库与已装插件都会保留；
+          升级向导里账号密码留空就表示"保持不变"，不会重置回默认值。
 
           ## 重要提醒
 
-          - 首次安装若未填写管理员密码，会自动生成随机密码，保存在应用数据目录的
-            \`initial-credentials.txt\`，请登录后尽快修改密码并删除该文件。
           - 应用默认监听 \`0.0.0.0\`，局域网内可直接访问。若需公网暴露，
-            请自行在前面加一层反向代理并启用 HTTPS。
+            请务必先改掉默认密码，并在前面加一层反向代理启用 HTTPS。
           - \`Config/Config.json\` 的优先级高于环境变量；在管理后台改的配置会落盘保存。
           NOTES
 
