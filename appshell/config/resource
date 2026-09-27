@@ -1,0 +1,12 @@
+{
+  "data-share": {
+    "shares": [
+      {
+        "name": "router2api",
+        "permission": {
+          "rw": ["Router2API"]
+        }
+      }
+    ]
+  }
+}

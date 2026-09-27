@@ -1,0 +1,21 @@
+#!/bin/bash
+# 卸载前：停止服务，避免留下孤儿进程
+
+set -u
+
+PKGVAR="${TRIM_PKGVAR:-}"
+
+if [ -x "${TRIM_APPDEST:-}/cmd/main" ]; then
+    "${TRIM_APPDEST}/cmd/main" uninstall >> "${PKGVAR}/logs/Router2API.log" 2>&1 || true
+fi
+
+# 兜底：按 PID 文件再确认一次
+for f in "${PKGVAR}/router2api.pid" "${PKGVAR}/redis.pid"; do
+    [ -f "${f}" ] || continue
+    pid=$(head -n 1 "${f}" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+        kill -TERM "${pid}" 2>/dev/null || true
+    fi
+done
+
+exit 0

@@ -1,0 +1,12 @@
+#!/bin/bash
+# 配置变更前：停止服务，让新的向导配置在重启后生效
+
+set -u
+
+PKGVAR="${TRIM_PKGVAR:-}"
+
+if [ -x "${TRIM_APPDEST:-}/cmd/main" ]; then
+    "${TRIM_APPDEST}/cmd/main" stop >> "${PKGVAR}/logs/Router2API.log" 2>&1 || true
+fi
+
+exit 0

@@ -1,0 +1,16 @@
+#!/bin/bash
+# 升级后：补齐新增目录并修正权限；服务由框架随后自动启动
+
+set -u
+
+APPDEST="${TRIM_APPDEST:-}"
+PKGVAR="${TRIM_PKGVAR:-}"
+
+mkdir -p "${PKGVAR}/data" "${PKGVAR}/logs" "${PKGVAR}/redis" 2>/dev/null || true
+mkdir -p "${PKGVAR}/Config" "${PKGVAR}/plugins/.subscription" 2>/dev/null || true
+
+chmod 755 "${APPDEST}/cmd/"* 2>/dev/null || true
+chmod 755 "${APPDEST}/redis/redis-server" 2>/dev/null || true
+chmod 755 "${APPDEST}/host/Router.Host" 2>/dev/null || true
+
+exit 0

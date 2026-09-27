@@ -1,0 +1,67 @@
+[
+  {
+    "stepTitle": "服务配置",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_port",
+        "label": "服务端口",
+        "initValue": "5242",
+        "rules": [
+          { "required": true, "message": "请输入端口" },
+          { "pattern": "^[0-9]+$", "message": "仅支持数字" },
+          { "pattern": "^(?:[1-9][0-9]{2,4})$", "message": "请输入 100-65535 之间的端口" }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "管理后台和模型接口都通过该端口访问。飞牛桌面点击 Router2API 图标即可打开，默认 5242，如与其他应用冲突可自行更换。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "管理后台凭据",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_admin_username",
+        "label": "管理员账号",
+        "initValue": "admin",
+        "rules": [
+          { "required": true, "message": "请输入管理员账号" }
+        ]
+      },
+      {
+        "type": "password",
+        "field": "wizard_admin_password",
+        "label": "管理员密码",
+        "rules": [
+          { "required": true, "message": "请输入管理员密码" },
+          { "min": 8, "message": "密码至少 8 位" }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "用于登录管理后台。Router2API 不提供默认密码，请务必设置一个只有你知道的密码。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "模型接口密钥",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_api_key",
+        "label": "下游 API Key（留空自动生成）",
+        "initValue": "",
+        "rules": [
+          { "pattern": "^$|^.{8,256}$", "message": "留空自动生成，或填写 8-256 个字符" }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "调用 /v1 模型接口时使用（Authorization: Bearer 密钥）。留空则自动生成一个随机密钥，安装完成后可在管理后台「设置」页查看和重置。"
+      }
+    ]
+  }
+]

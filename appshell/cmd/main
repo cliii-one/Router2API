@@ -1,0 +1,826 @@
+#!/bin/bash
+# =============================================================
+# Router2API - 飞牛 fnOS 生命周期控制脚本（start / stop / status / restart）
+#
+# 一个应用进程组里跑两个服务：
+#   1. Redis  —— 包内自带二进制，监听 127.0.0.1，只给本应用用
+#   2. Router2API Host（.NET 自包含程序）—— 对外提供管理后台与 /v1 接口
+#
+# 设计要点：
+#   - Redis 端口从主端口 +10000 派生，避免与系统或其他应用冲突
+#   - 所有运行时数据落在 TRIM_PKGVAR（重启保留），升级不丢数据
+#   - 配置写到 Config/Config.json（上游优先级最高），环境变量只做首次引导
+# =============================================================
+
+set -u
+
+APPNAME="${TRIM_APPNAME:-Router2API}"
+APPDEST="${TRIM_APPDEST:-}"
+PKGVAR="${TRIM_PKGVAR:-}"
+
+if [ -z "${APPDEST}" ] || [ -z "${PKGVAR}" ]; then
+    echo "ERROR: TRIM_APPDEST or TRIM_PKGVAR not set" >&2
+    exit 1
+fi
+
+# ---------- 路径约定 ----------
+# 主机程序位于 target/host/Router.Host（自包含，含 .NET 运行时）
+HOST_DIR="${APPDEST}/host"
+HOST_DLL="${HOST_DIR}/Router.Host.dll"
+# 自包含发布自带 dotnet 可执行文件（apphost）
+HOST_BIN="${HOST_DIR}/Router.Host"
+
+REDIS_BIN="${APPDEST}/redis/redis-server"
+REDIS_LIB_DIR="${APPDEST}/redis/lib"
+
+LOG_DIR="${PKGVAR}/logs"
+APP_LOG="${LOG_DIR}/Router2API.log"
+REDIS_LOG="${LOG_DIR}/redis.log"
+MAIN_PID_FILE="${PKGVAR}/router2api.pid"
+REDIS_PID_FILE="${PKGVAR}/redis.pid"
+
+# 工作目录固定为 PKGVAR（var 目录，升级/重启都保留）：
+#   上游按“当前工作目录”读 Config/Config.json，并把 SQLite 相对路径解析到这里。
+#   若用 APPDEST（target 目录），升级时整个目录会被替换，
+#   管理员密码、API Key、数据库和已装插件都会丢失，因此必须落在 var。
+WORK_DIR="${PKGVAR}"
+
+# 插件目录：上游硬编码为 AppContext.BaseDirectory/plugins，即程序所在目录，
+# 同样位于 target 里会被升级覆盖。用一个软链把它指到持久化的 var 目录。
+HOST_PLUGINS_DIR="${HOST_DIR}/plugins"
+PERSIST_PLUGINS_DIR="${PKGVAR}/plugins"
+
+# ---------- 端口 ----------
+SERVICE_PORT="${wizard_port:-${TRIM_SERVICE_PORT:-5242}}"
+case "${SERVICE_PORT}" in
+    ''|*[!0-9]*) SERVICE_PORT=5242 ;;
+esac
+# Redis 用主端口 +10000，规律可预测且几乎不会撞车（如 5242 -> 15242）
+REDIS_PORT=$((SERVICE_PORT + 10000))
+
+log_msg() {
+    mkdir -p "${LOG_DIR}" 2>/dev/null || true
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${APP_LOG}" 2>/dev/null || true
+}
+
+# 用户可见的错误：写入飞牛提供的临时日志文件，安装/启动界面会展示
+user_error() {
+    echo "$1" >&2
+    if [ -n "${TRIM_TEMP_LOGFILE:-}" ]; then
+        echo "$1" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null || true
+    fi
+}
+
+# ---------- 日志轮转：单文件超过 10MB 就留一份 .1，防止无限增长 ----------
+rotate_log_if_needed() {
+    local file="$1"
+    [ -f "${file}" ] || return 0
+    local size
+    size=$(stat -c%s "${file}" 2>/dev/null || echo 0)
+    if [ "${size}" -gt $((10 * 1024 * 1024)) ]; then
+        mv -f "${file}" "${file}.1" 2>/dev/null || true
+    fi
+}
+
+# =============================================================
+# 进程存活判断
+# =============================================================
+
+# 判断 PID 是否存活
+is_alive() {
+    local pid="$1"
+    [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null
+}
+
+# 读取 PID 文件内容
+read_pid() {
+    local file="$1"
+    [ -f "${file}" ] || return 1
+    local pid
+    pid=$(head -n 1 "${file}" 2>/dev/null | tr -d '[:space:]')
+    [ -n "${pid}" ] || return 1
+    printf '%s' "${pid}"
+}
+
+# 校验 PID 确实是我们自己的进程，避免 PID 复用导致误杀别人的进程。
+# 用 /proc/<pid>/exe 与 cmdline 双重比对。
+pid_is_ours() {
+    local pid="$1" kind="$2"
+    is_alive "${pid}" || return 1
+    local exe cl
+    exe=$(readlink "/proc/${pid}/exe" 2>/dev/null || true)
+    cl=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)
+
+    case "${kind}" in
+        redis)
+            case "${exe}" in "${REDIS_BIN}"|*"/redis/redis-server"*) return 0 ;; esac
+            case "${cl}" in *"${REDIS_BIN}"*) return 0 ;; esac
+            ;;
+        host)
+            # 自包含 apphost：exe 就是 Router.Host；dotnet xxx.dll 方式则看 cmdline
+            case "${exe}" in "${HOST_BIN}"|*"/host/Router.Host"*) return 0 ;; esac
+            case "${cl}" in *"${HOST_DLL}"*|*"/host/Router.Host"*) return 0 ;; esac
+            ;;
+    esac
+    return 1
+}
+
+# PID 文件失效时，按可执行文件路径反查存活进程（排除脚本自身）
+find_pids_by_path() {
+    local pattern="$1"
+    pgrep -f "${pattern}" 2>/dev/null | grep -vx "$$" || true
+}
+
+# =============================================================
+# Redis 管理
+# =============================================================
+
+redis_running() {
+    local pid
+    pid=$(read_pid "${REDIS_PID_FILE}") || return 1
+    pid_is_ours "${pid}" redis
+}
+
+start_redis() {
+    if redis_running; then
+        log_msg "Redis already running (PID $(read_pid "${REDIS_PID_FILE}"))"
+        return 0
+    fi
+
+    if [ ! -x "${REDIS_BIN}" ]; then
+        user_error "✗ Redis 组件缺失，安装包不完整，请重新下载安装。"
+        return 1
+    fi
+
+    # Redis 配置：只监听回环地址，只给本应用连接，不设密码也无需对外暴露
+    local redis_dir="${PKGVAR}/redis"
+    mkdir -p "${redis_dir}" 2>/dev/null || true
+
+    # 二进制依赖 liblzf（Debian 的 redis 打包于此），跟随包一起发布
+    export LD_LIBRARY_PATH="${REDIS_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
+    "${REDIS_BIN}" \
+        --port "${REDIS_PORT}" \
+        --bind 127.0.0.1 \
+        --protected-mode yes \
+        --dir "${redis_dir}" \
+        --daemonize no \
+        --save '' \
+        --appendonly no \
+        --maxmemory 128mb \
+        --maxmemory-policy allkeys-lru \
+        --logfile "" \
+        >> "${REDIS_LOG}" 2>&1 &
+
+    local pid=$!
+    printf '%s' "${pid}" > "${REDIS_PID_FILE}"
+
+    # 就绪探测：最多等 10 秒，确认真的在监听
+    local count=0
+    while [ ${count} -lt 10 ]; do
+        if ! is_alive "${pid}"; then
+            log_msg "ERROR: Redis exited early"
+            rm -f "${REDIS_PID_FILE}"
+            user_error "✗ Redis 启动失败，请查看日志 ${REDIS_LOG}"
+            return 1
+        fi
+        if redis_ping; then
+            log_msg "Redis started on 127.0.0.1:${REDIS_PORT} (PID ${pid})"
+            return 0
+        fi
+        sleep 1
+        count=$((count + 1))
+    done
+    log_msg "ERROR: Redis did not become ready in time"
+    return 1
+}
+
+# 用包内 redis-cli（若无则退回 TCP 探测）确认服务可用
+redis_ping() {
+    local cli="${APPDEST}/redis/redis-cli"
+    if [ -x "${cli}" ]; then
+        local out
+        out=$(LD_LIBRARY_PATH="${REDIS_LIB_DIR}" "${cli}" -h 127.0.0.1 -p "${REDIS_PORT}" PING 2>/dev/null || true)
+        [ "${out}" = "PONG" ] && return 0
+    fi
+    # 兜底：能建立 TCP 连接即视为已监听
+    (exec 3<>"/dev/tcp/127.0.0.1/${REDIS_PORT}") 2>/dev/null && return 0
+    return 1
+}
+
+stop_redis() {
+    local pid
+    pid=$(read_pid "${REDIS_PID_FILE}") || true
+
+    if [ -n "${pid:-}" ] && pid_is_ours "${pid}" redis; then
+        log_msg "Stopping Redis (PID ${pid})"
+        kill -TERM "${pid}" 2>/dev/null || true
+        local count=0
+        while is_alive "${pid}" && [ ${count} -lt 10 ]; do
+            sleep 1
+            count=$((count + 1))
+        done
+        if is_alive "${pid}"; then
+            log_msg "Force killing Redis (PID ${pid})"
+            kill -KILL "${pid}" 2>/dev/null || true
+        fi
+    fi
+
+    # 兜底清理：PID 文件丢失时按包内路径精确回收
+    for p in $(find_pids_by_path "${REDIS_BIN}"); do
+        kill -TERM "${p}" 2>/dev/null || true
+    done
+    rm -f "${REDIS_PID_FILE}" 2>/dev/null || true
+    return 0
+}
+
+# =============================================================
+# Router2API 主进程管理
+# =============================================================
+
+host_running() {
+    local pid
+    pid=$(read_pid "${MAIN_PID_FILE}") || return 1
+    pid_is_ours "${pid}" host
+}
+
+# =============================================================
+# 配置管理（Config/Config.json）
+#
+# 上游配置优先级：Config.json > User Secrets > ROUTER2API_ 环境变量，
+# 所以必须落盘到文件，否则用户后续在后台改了密码会被环境变量覆盖。
+#
+# 文件里的字段分两类，处理策略不同：
+#   【凭据类】管理员账号/密码、API Key —— 只在安装向导填了值时才改，
+#             否则会覆盖用户在管理后台改过的密码。
+#   【派生类】数据库路径、Redis 连接串 —— 由 PKGVAR 和端口推导而来。
+#             换存储空间或改端口后必须跟着变，所以每次启动都自愈。
+# =============================================================
+
+# 配置文件路径（工作目录 = var，见 WORK_DIR 说明）
+config_file_path() {
+    printf '%s' "${WORK_DIR}/Config/Config.json"
+}
+
+# 首次安装建配置；已有配置则只在向导提供了新凭据时更新凭据
+ensure_config() {
+    local cfg_dir="${WORK_DIR}/Config"
+    local cfg_file
+    cfg_file=$(config_file_path)
+    mkdir -p "${cfg_dir}" 2>/dev/null || true
+
+    local admin_user="${wizard_admin_username:-admin}"
+    local admin_pass="${wizard_admin_password:-}"
+    local api_key="${wizard_api_key:-}"
+
+    # 没有新凭据要写：仅保证文件存在，其余交给 sync_derived_config
+    if [ -f "${cfg_file}" ] && [ -z "${admin_pass}" ] && [ -z "${wizard_admin_username:-}" ] && [ -z "${api_key}" ]; then
+        log_msg "Existing Config.json kept (no new credentials from wizard)"
+        return 0
+    fi
+
+    # 首次安装且没给密码：生成随机强密码，避免空密码无法登录
+    local generated_password=""
+    if [ ! -f "${cfg_file}" ] && [ -z "${admin_pass}" ]; then
+        admin_pass=$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        generated_password="${admin_pass}"
+    fi
+
+    # 首次安装且没给 API Key：按上游格式生成 sk-router- + 48 位十六进制
+    if [ -z "${api_key}" ] && [ ! -f "${cfg_file}" ]; then
+        api_key="sk-router-$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    fi
+
+    if ! write_config "${cfg_file}" "${admin_user}" "${admin_pass}" "${api_key}"; then
+        user_error "✗ 生成配置文件失败，请检查磁盘空间与权限。"
+        return 1
+    fi
+    chmod 600 "${cfg_file}" 2>/dev/null || true
+
+    # 随机生成的初始凭据单独存一份，方便用户在文件管理里查看
+    # 文件名用 ASCII，避免个别安装器对非 ASCII 文件名处理异常
+    if [ -n "${generated_password}" ]; then
+        write_initial_credentials "${admin_user}" "${generated_password}" "${api_key}"
+    fi
+
+    log_msg "Config.json written (admin=${admin_user}, redis=127.0.0.1:${REDIS_PORT})"
+    return 0
+}
+
+# 写配置文件。已有文件时是"合并更新"，不丢掉用户自己加的字段。
+write_config() {
+    local cfg_file="$1" user="$2" pass="$3" key="$4"
+    local db_path="${PKGVAR}/data/router2api.db"
+    local redis_conn="127.0.0.1:${REDIS_PORT}"
+
+    if command -v python3 >/dev/null 2>&1; then
+        CFG_FILE="${cfg_file}" CFG_USER="${user}" CFG_PASS="${pass}" CFG_KEY="${key}" \
+        CFG_DB="${db_path}" CFG_REDIS="${redis_conn}" \
+        CFG_HAS_FILE="$([ -f "${cfg_file}" ] && echo 1 || echo 0)" \
+        python3 - <<'PYEOF'
+import json, os
+
+path = os.environ["CFG_FILE"]
+# 已有配置：读进来做合并更新，保留用户自己添加的字段
+if os.environ.get("CFG_HAS_FILE") == "1":
+    try:
+        with open(path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except Exception:
+        cfg = {}
+else:
+    cfg = {}
+
+cfg["Database"] = {"Path": os.environ["CFG_DB"]}
+redis = cfg.setdefault("Redis", {})
+if not isinstance(redis, dict):
+    redis = {}
+    cfg["Redis"] = redis
+redis["ConnectionString"] = os.environ["CFG_REDIS"]
+redis.setdefault("InstanceName", "router2api:")
+
+auth = cfg.setdefault("Auth", {})
+admin = auth.setdefault("Admin", {})
+admin.setdefault("Enabled", True)
+admin.setdefault("SessionLifetimeHours", 12)
+users = admin.setdefault("Users", [])
+if not users or not isinstance(users, list):
+    users = []
+    admin["Users"] = users
+if not users:
+    users.append({"DisplayName": "Administrator", "Roles": ["admin"]})
+# 账号名总是采用向导值；密码为空表示"保持不变"
+if os.environ.get("CFG_USER"):
+    users[0]["Username"] = os.environ["CFG_USER"]
+if os.environ.get("CFG_PASS"):
+    users[0]["Password"] = os.environ["CFG_PASS"]
+    users[0].pop("PasswordHash", None)
+if not users[0].get("DisplayName"):
+    users[0]["DisplayName"] = "Administrator"
+if not users[0].get("Roles"):
+    users[0]["Roles"] = ["admin"]
+
+api_key = auth.setdefault("ApiKey", {})
+api_key.setdefault("Enabled", True)
+if os.environ.get("CFG_KEY"):
+    api_key["Key"] = os.environ["CFG_KEY"]
+
+logging_cfg = cfg.setdefault("Logging", {})
+logging_cfg.setdefault("DataRetentionDays", 30)
+logging_cfg.setdefault("CleanupCron", "0 0 3 * * *")
+logging_cfg.setdefault("MinimumPluginLogLevel", "Information")
+cfg.setdefault("AllowedHosts", "*")
+
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh, ensure_ascii=False, indent=2)
+PYEOF
+        return $?
+    fi
+
+    # 没有 python3 时的兜底：只写一份全新配置（不合并）
+    local esc_user esc_pass esc_key
+    esc_user=$(printf '%s' "${user}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    esc_pass=$(printf '%s' "${pass}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    esc_key=$(printf '%s' "${key}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    cat > "${cfg_file}" <<EOF
+{
+  "Database": { "Path": "${db_path}" },
+  "Redis": { "ConnectionString": "${redis_conn}", "InstanceName": "router2api:" },
+  "Auth": {
+    "Admin": {
+      "Enabled": true,
+      "SessionLifetimeHours": 12,
+      "Users": [
+        { "Username": "${esc_user}", "Password": "${esc_pass}", "DisplayName": "Administrator", "Roles": ["admin"] }
+      ]
+    },
+    "ApiKey": { "Enabled": true, "Key": "${esc_key}" }
+  },
+  "Logging": { "DataRetentionDays": 30, "CleanupCron": "0 0 3 * * *", "MinimumPluginLogLevel": "Information" },
+  "AllowedHosts": "*"
+}
+EOF
+    return $?
+}
+
+# 每次启动自愈"派生字段"：数据库路径与 Redis 连接串。
+# 场景：用户换了存储空间（PKGVAR 变）或在向导里改了端口（REDIS_PORT 变）。
+# 只动这两个字段，绝不碰密码和 API Key。
+sync_derived_config() {
+    local cfg_file
+    cfg_file=$(config_file_path)
+    [ -f "${cfg_file}" ] || return 0
+
+    local db_path="${PKGVAR}/data/router2api.db"
+    local redis_conn="127.0.0.1:${REDIS_PORT}"
+
+    # 已经是目标值就跳过，避免每次启动都写文件
+    if grep -qF "\"Path\": \"${db_path}\"" "${cfg_file}" 2>/dev/null \
+       && grep -qF "\"ConnectionString\": \"${redis_conn}\"" "${cfg_file}" 2>/dev/null; then
+        return 0
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_msg "WARN: python3 unavailable, skip derived config sync"
+        return 0
+    fi
+
+    CFG_FILE="${cfg_file}" CFG_DB="${db_path}" CFG_REDIS="${redis_conn}" python3 - <<'PYEOF'
+import json, os
+path = os.environ["CFG_FILE"]
+try:
+    with open(path, encoding="utf-8") as fh:
+        cfg = json.load(fh)
+except Exception:
+    # 配置损坏时不在这里抢修，交给上游按默认值重建
+    raise SystemExit(0)
+
+cfg["Database"] = {"Path": os.environ["CFG_DB"]}
+redis = cfg.setdefault("Redis", {})
+if not isinstance(redis, dict):
+    redis = {}
+    cfg["Redis"] = redis
+redis["ConnectionString"] = os.environ["CFG_REDIS"]
+redis.setdefault("InstanceName", "router2api:")
+
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh, ensure_ascii=False, indent=2)
+PYEOF
+    if [ $? -eq 0 ]; then
+        chmod 600 "${cfg_file}" 2>/dev/null || true
+        log_msg "Derived config synced (db=${db_path}, redis=${redis_conn})"
+    else
+        log_msg "WARN: derived config sync failed"
+    fi
+    return 0
+}
+
+# 把随机生成的初始凭据写到 var 下，方便用户查看
+write_initial_credentials() {
+    local user="$1" pass="$2" key="$3"
+    local cred_file="${PKGVAR}/initial-credentials.txt"
+    {
+        echo "Router2API 初始登录凭据（首次安装自动生成）"
+        echo "生成时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "管理后台: http://<NAS地址>:${SERVICE_PORT}/"
+        echo "管理员账号: ${user}"
+        echo "管理员密码: ${pass}"
+        echo "下游 API Key: ${key}"
+        echo
+        echo "建议登录管理后台后立即修改密码，并删除本文件。"
+    } > "${cred_file}" 2>/dev/null || true
+    chmod 600 "${cred_file}" 2>/dev/null || true
+    log_msg "Initial credentials written to ${cred_file}"
+}
+
+# =============================================================
+# 插件目录持久化
+#
+# 上游把插件根目录硬编码为 AppContext.BaseDirectory/plugins，
+# 也就是 target/host/plugins。这个位置在升级时会被整包替换，
+# 用户已安装的插件会全部丢失。
+# 做法：把 target/host/plugins 做成指向 var/plugins 的软链。
+#   首次安装：把包内预置的 plugins 内容搬到 var，再建软链。
+#   升级：软链已存在则保持，用户插件不受影响。
+#   不支持的场景（无法建软链）：退回真实目录，仅提示不阻断启动。
+# =============================================================
+ensure_plugins_link() {
+    mkdir -p "${PERSIST_PLUGINS_DIR}/.subscription" 2>/dev/null || true
+
+    # 已经是软链且指向正确位置：完成
+    if [ -L "${HOST_PLUGINS_DIR}" ]; then
+        local current
+        current=$(readlink -f "${HOST_PLUGINS_DIR}" 2>/dev/null || true)
+        if [ "${current}" = "${PERSIST_PLUGINS_DIR}" ]; then
+            return 0
+        fi
+        # 指向别处：清掉重建
+        rm -f "${HOST_PLUGINS_DIR}" 2>/dev/null || true
+    fi
+
+    # 真实目录（首次安装或升级后重建）：把内容搬迁到 var，再换成软链
+    if [ -d "${HOST_PLUGINS_DIR}" ] && [ ! -L "${HOST_PLUGINS_DIR}" ]; then
+        # 只在 var 侧还没有内容时搬运，避免覆盖用户已装插件
+        if [ -z "$(ls -A "${PERSIST_PLUGINS_DIR}" 2>/dev/null)" ]; then
+            cp -a "${HOST_PLUGINS_DIR}/." "${PERSIST_PLUGINS_DIR}/" 2>/dev/null || true
+        fi
+        rm -rf "${HOST_PLUGINS_DIR}" 2>/dev/null || true
+    fi
+
+    if ln -s "${PERSIST_PLUGINS_DIR}" "${HOST_PLUGINS_DIR}" 2>/dev/null; then
+        log_msg "Plugins directory linked: ${HOST_PLUGINS_DIR} -> ${PERSIST_PLUGINS_DIR}"
+        return 0
+    fi
+
+    # 建软链失败（例如文件系统不支持）：退回真实目录，保证应用可用
+    log_msg "WARN: cannot create plugins symlink, falling back to real directory"
+    mkdir -p "${HOST_PLUGINS_DIR}" 2>/dev/null || true
+    return 0
+}
+
+# =============================================================
+# 同步桌面入口端口
+#
+# 飞牛读 target/ui/config 里的 port 来生成桌面入口和 iframe 地址。
+# 用户在安装向导或应用设置里改了端口后，这个文件仍是打包时的旧端口，
+# 点图标就会打开错误地址。这里在启动前把 port 改成实际使用的端口。
+# =============================================================
+sync_ui_port() {
+    local ui_config="${APPDEST}/ui/config"
+    [ -f "${ui_config}" ] || return 0
+
+    # 已经是目标端口就不动，避免每次启动都写文件
+    if grep -qE "\"port\"[[:space:]]*:[[:space:]]*\"${SERVICE_PORT}\"" "${ui_config}" 2>/dev/null; then
+        return 0
+    fi
+
+    # 只替换 port 字段的值，保留其余内容与格式
+    local tmp="${ui_config}.tmp.$$"
+    if sed -E "s/(\"port\"[[:space:]]*:[[:space:]]*\")[^\"]*(\")/\1${SERVICE_PORT}\2/" \
+            "${ui_config}" > "${tmp}" 2>/dev/null; then
+        cat "${tmp}" > "${ui_config}" 2>/dev/null && log_msg "UI entry port synced to ${SERVICE_PORT}"
+        rm -f "${tmp}" 2>/dev/null || true
+    fi
+    return 0
+}
+
+start_host() {
+    if host_running; then
+        log_msg "Router2API already running (PID $(read_pid "${MAIN_PID_FILE}"))"
+        return 0
+    fi
+
+    # 优先用自包含 apphost，缺失时退回 dotnet 运行（便于开发期调试）
+    local runner=""
+    if [ -x "${HOST_BIN}" ]; then
+        runner="${HOST_BIN}"
+    elif [ -x "${HOST_DIR}/dotnet" ] && [ -f "${HOST_DLL}" ]; then
+        runner="${HOST_DIR}/dotnet ${HOST_DLL}"
+    else
+        user_error "✗ 主程序缺失，安装包不完整，请重新下载安装。"
+        return 1
+    fi
+
+    mkdir -p "${PKGVAR}/data" 2>/dev/null || true
+
+    # 插件目录持久化：上游固定读「程序目录/plugins」，
+    # 这里把它软链到 var/plugins，升级替换 target 时插件不会丢。
+    ensure_plugins_link || return 1
+
+    # 关键：切换到 WORK_DIR，让上游按预期解析 Config/ 与 data/
+    cd "${WORK_DIR}" || return 1
+
+    export ASPNETCORE_ENVIRONMENT=Production
+    export ASPNETCORE_URLS="http://0.0.0.0:${SERVICE_PORT}"
+    # ★ 关键：ContentRoot 默认跟随"当前工作目录"。我们把工作目录设成了 var
+    #   （为了让 Config.json 持久化），若不显式指定，ASP.NET Core 会在
+    #   var 下找 wwwroot 和 appsettings.json，结果是：
+    #     - 管理后台首页 404（找不到 wwwroot/index.html）
+    #     - appsettings.json 里的默认配置读不到
+    #   所以这里把 ContentRoot 指回程序目录，两者各归其位：
+    #     ContentRoot = target/host → 找 wwwroot、appsettings.json
+    #     工作目录    = var         → 上游按 Directory.GetCurrentDirectory() 找 Config/
+    export ASPNETCORE_CONTENTROOT="${HOST_DIR}"
+    export TZ="${TZ:-Asia/Shanghai}"
+    export DOTNET_RUNNING_IN_CONTAINER=false
+    # 关闭首次运行欢迎信息与遥测，日志更干净
+    export DOTNET_NOLOGO=1
+    export DOTNET_CLI_TELEMETRY_OPTOUT=1
+    # 数据与配置路径通过环境变量兜底（Config.json 缺失时仍能正确落盘）
+    export ROUTER2API_Database__Path="${PKGVAR}/data/router2api.db"
+    export ROUTER2API_Redis__ConnectionString="127.0.0.1:${REDIS_PORT}"
+    export ROUTER2API_Redis__InstanceName="router2api:"
+
+    # shellcheck disable=SC2086
+    ${runner} >> "${APP_LOG}" 2>&1 &
+    local pid=$!
+    printf '%s' "${pid}" > "${MAIN_PID_FILE}"
+    log_msg "Started Router2API on port ${SERVICE_PORT} (PID ${pid})"
+
+    # 启动探测：最多等 30 秒。
+    # 判据是"我们的进程活着 + 能拿到 Router2API 的响应"，
+    # 而不是"端口在监听"——后者会被别的程序占用的端口骗过去。
+    local count=0
+    while [ ${count} -lt 30 ]; do
+        if ! is_alive "${pid}"; then
+            log_msg "ERROR: Router2API exited early (after ${count}s)"
+            rm -f "${MAIN_PID_FILE}"
+            # 从日志里判断是不是端口冲突，给用户明确指引
+            if grep -qi "address already in use\|Failed to bind" "${APP_LOG}" 2>/dev/null; then
+                user_error "✗ 端口 ${SERVICE_PORT} 已被其他程序占用，请在应用设置中更换端口后重启。"
+            else
+                user_error "✗ Router2API 启动失败，请查看日志 ${APP_LOG}"
+            fi
+            return 1
+        fi
+        if service_ready "${pid}"; then
+            log_msg "Router2API is ready on port ${SERVICE_PORT}"
+            return 0
+        fi
+        sleep 1
+        count=$((count + 1))
+    done
+
+    # 超时：区分"端口被别人占"与"只是初始化慢"
+    if port_listening && ! service_ready "${pid}"; then
+        log_msg "ERROR: port ${SERVICE_PORT} is served by another process"
+        stop_host
+        user_error "✗ 端口 ${SERVICE_PORT} 已被其他程序占用，请在应用设置中更换端口后重启。"
+        return 1
+    fi
+    log_msg "WARN: service not ready after 30s, process still alive"
+    return 0
+}
+
+# 判断主端口是否已被监听
+port_listening() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -tln 2>/dev/null | grep -qE ":${SERVICE_PORT}[[:space:]]" && return 0
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tln 2>/dev/null | grep -qE ":${SERVICE_PORT}[[:space:]]" && return 0
+    fi
+    return 1
+}
+
+# 服务是否真的由"我们的进程"在提供。
+#
+# 为什么不能只看端口在监听：
+#   如果端口已被别的程序占用，我们的进程会绑定失败并退出，
+#   但端口仍然是"监听中"状态，只看端口会误报"启动成功"，
+#   用户在桌面上点开却是别人的页面（实测踩过这个坑）。
+# 做法：① 进程必须还活着；② 必须能拿到 Router2API 的特征响应。
+service_ready() {
+    local pid="$1"
+    is_alive "${pid}" || return 1
+
+    # 用 HTTP 探测确认是我们的服务：
+    # Router2API 的根路径会返回管理后台 HTML，看标题最直接。
+    if command -v curl >/dev/null 2>&1; then
+        local body
+        body=$(curl -s --max-time 5 "http://127.0.0.1:${SERVICE_PORT}/" 2>/dev/null || true)
+        case "${body}" in
+            *"Router2API"*) return 0 ;;
+        esac
+        # 首页可能是前端 SPA，退一步探测管理接口是否存在
+        local code
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            "http://127.0.0.1:${SERVICE_PORT}/api/admin/me" 2>/dev/null || true)
+        [ "${code}" = "401" ] || [ "${code}" = "200" ] && return 0
+        # 端口有人在听但不是我们的服务
+        return 1
+    fi
+
+    # 没有 curl 时退回端口检查（尽力而为）
+    port_listening
+}
+
+# 端口被谁占用（返回 PID，可能为空）
+port_owner_pid() {
+    local owner=""
+    if command -v ss >/dev/null 2>&1; then
+        owner=$(ss -tlnp 2>/dev/null | grep -E ":${SERVICE_PORT}[[:space:]]" \
+            | sed -n 's/.*pid=\([0-9]\+\).*/\1/p' | head -n 1)
+    elif command -v netstat >/dev/null 2>&1; then
+        owner=$(netstat -tlnp 2>/dev/null | grep -E ":${SERVICE_PORT}[[:space:]]" \
+            | sed -n 's/.*[[:space:]]\([0-9]\+\)\/[^[:space:]]*[[:space:]]*$/\1/p' | head -n 1)
+    fi
+    [ -n "${owner}" ] && printf '%s' "${owner}"
+}
+
+stop_host() {
+    local pid
+    pid=$(read_pid "${MAIN_PID_FILE}") || true
+
+    if [ -n "${pid:-}" ] && pid_is_ours "${pid}" host; then
+        log_msg "Stopping Router2API (PID ${pid})"
+        kill -TERM "${pid}" 2>/dev/null || true
+        local count=0
+        while is_alive "${pid}" && [ ${count} -lt 15 ]; do
+            sleep 1
+            count=$((count + 1))
+        done
+        if is_alive "${pid}"; then
+            log_msg "Force killing Router2API (PID ${pid})"
+            kill -KILL "${pid}" 2>/dev/null || true
+        fi
+    fi
+
+    # 兜底：PID 文件丢失时按包内路径精确回收
+    for p in $(find_pids_by_path "${HOST_DIR}/Router.Host"); do
+        kill -TERM "${p}" 2>/dev/null || true
+    done
+    rm -f "${MAIN_PID_FILE}" 2>/dev/null || true
+    return 0
+}
+
+# =============================================================
+# 对外命令
+# =============================================================
+
+do_start() {
+    rotate_log_if_needed "${APP_LOG}"
+    rotate_log_if_needed "${REDIS_LOG}"
+    log_msg "=== start requested (port=${SERVICE_PORT}, redis=${REDIS_PORT}) ==="
+
+    # 端口占用检查：只对"非本应用进程"报错
+    local owner
+    owner=$(port_owner_pid)
+    if [ -n "${owner}" ] && [ "${owner}" != "$(read_pid "${MAIN_PID_FILE}" 2>/dev/null || echo '')" ]; then
+        if ! pid_is_ours "${owner}" host; then
+            user_error "✗ 端口 ${SERVICE_PORT} 已被其他程序占用（PID ${owner}），请在应用设置中更换端口。"
+            return 1
+        fi
+    fi
+
+    ensure_config || return 1
+    # 自愈派生字段：换存储空间或改端口后，数据库路径与 Redis 地址要跟着变
+    sync_derived_config
+    # 让桌面入口跟随实际端口（用户可能改过向导里的端口）
+    sync_ui_port
+
+    # 先起 Redis：主程序启动即连 Redis，顺序反了会报错
+    start_redis || return 1
+    start_host || return 1
+    return 0
+}
+
+do_stop() {
+    log_msg "=== stop requested ==="
+    stop_host
+    stop_redis
+    # 端口确认已释放，否则如实报告
+    if port_listening; then
+        sleep 2
+        if port_listening; then
+            log_msg "ERROR: port ${SERVICE_PORT} still bound after stop"
+            user_error "✗ 停止失败：端口 ${SERVICE_PORT} 仍被占用，请查看日志 ${APP_LOG}"
+            return 1
+        fi
+    fi
+    log_msg "Stopped successfully"
+    return 0
+}
+
+do_status() {
+    if host_running; then
+        return 0
+    fi
+    # PID 文件丢失时按路径找回，避免误报"未运行"
+    local found
+    found=$(find_pids_by_path "${HOST_DIR}/Router.Host" | head -n 1)
+    if [ -n "${found}" ] && pid_is_ours "${found}" host; then
+        printf '%s' "${found}" > "${MAIN_PID_FILE}"
+        return 0
+    fi
+    return 3
+}
+
+case "${1:-}" in
+    start)
+        if do_start; then
+            echo "✓ Router2API 启动成功，访问端口 ${SERVICE_PORT}"
+            exit 0
+        else
+            echo "✗ Router2API 启动失败，详情见 ${APP_LOG}"
+            exit 1
+        fi
+        ;;
+    stop)
+        if do_stop; then
+            echo "✓ Router2API 已停止"
+            exit 0
+        else
+            echo "✗ Router2API 停止失败"
+            exit 1
+        fi
+        ;;
+    status)
+        if do_status; then
+            echo "✓ Router2API 运行中"
+            exit 0
+        else
+            echo "✗ Router2API 未运行"
+            exit 3
+        fi
+        ;;
+    restart)
+        do_stop
+        sleep 1
+        if do_start; then
+            echo "✓ Router2API 重启成功"
+            exit 0
+        else
+            echo "✗ Router2API 重启失败"
+            exit 1
+        fi
+        ;;
+    uninstall)
+        do_stop
+        echo "✓ 已清理"
+        exit 0
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|status|restart|uninstall}"
+        exit 1
+        ;;
+esac

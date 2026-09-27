@@ -1,0 +1,32 @@
+#!/bin/bash
+# 安装后初始化：准备数据目录并统一文件权限
+# 注意：不在这里启动服务，也不打印凭据（启动由框架随后调用 cmd/main start）
+
+set -u
+
+APPDEST="${TRIM_APPDEST:-}"
+PKGVAR="${TRIM_PKGVAR:-}"
+
+# 运行时目录：数据库、日志、Redis 数据、配置
+# 注意：Config 放在 var 而不是 target —— 上游按工作目录读 Config/Config.json，
+#      而 target 在升级时会被整包替换，放这里会导致密码与密钥丢失。
+mkdir -p "${PKGVAR}/data" "${PKGVAR}/logs" "${PKGVAR}/redis" "${PKGVAR}/Config" 2>/dev/null || true
+mkdir -p "${PKGVAR}/plugins/.subscription" 2>/dev/null || true
+chmod 755 "${PKGVAR}" "${PKGVAR}/data" "${PKGVAR}/logs" "${PKGVAR}/redis" 2>/dev/null || true
+chmod 755 "${PKGVAR}/Config" "${PKGVAR}/plugins" 2>/dev/null || true
+
+# 兼容处理：若包内或旧版本在 target 下留了 Config，迁移到 var 后移除
+if [ -d "${APPDEST}/Config" ] && [ ! -L "${APPDEST}/Config" ]; then
+    if [ -z "$(ls -A "${PKGVAR}/Config" 2>/dev/null)" ]; then
+        cp -a "${APPDEST}/Config/." "${PKGVAR}/Config/" 2>/dev/null || true
+    fi
+    rm -rf "${APPDEST}/Config" 2>/dev/null || true
+fi
+
+# 保证可执行位没在打包/解包过程中丢失
+chmod 755 "${APPDEST}/cmd/main" 2>/dev/null || true
+chmod 755 "${APPDEST}/cmd/"* 2>/dev/null || true
+chmod 755 "${APPDEST}/redis/redis-server" 2>/dev/null || true
+chmod 755 "${APPDEST}/host/Router.Host" 2>/dev/null || true
+
+exit 0

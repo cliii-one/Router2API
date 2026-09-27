@@ -1,0 +1,63 @@
+#!/bin/bash
+# 配置变更后：若向导提供了新凭据则更新 Config.json，然后重启服务
+# 注意：cmd/main 启动时会自行同步"派生字段"（数据库路径、Redis 地址），
+# 所以这里只需要处理"凭据字段"。
+
+set -u
+
+APPDEST="${TRIM_APPDEST:-}"
+PKGVAR="${TRIM_PKGVAR:-}"
+# Config.json 位于 var（见 cmd/main 中 WORK_DIR 的说明），不是 target
+CFG_FILE="${PKGVAR}/Config/Config.json"
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${PKGVAR}/logs/Router2API.log" 2>/dev/null || true
+}
+
+# 仅当向导确实填了新密码/新账号时才改动配置文件，空值一律忽略
+NEW_USER="${wizard_admin_username:-}"
+NEW_PASS="${wizard_admin_password:-}"
+
+if [ -f "${CFG_FILE}" ] && { [ -n "${NEW_USER}" ] || [ -n "${NEW_PASS}" ]; }; then
+    if command -v python3 >/dev/null 2>&1; then
+        CFG_FILE="${CFG_FILE}" NEW_USER="${NEW_USER}" NEW_PASS="${NEW_PASS}" python3 - <<'PYEOF'
+import json, os
+path = os.environ["CFG_FILE"]
+try:
+    with open(path, encoding="utf-8") as fh:
+        cfg = json.load(fh)
+except Exception:
+    raise SystemExit(0)
+
+users = cfg.setdefault("Auth", {}).setdefault("Admin", {}).setdefault("Users", [])
+if not users:
+    users.append({"DisplayName": "Administrator", "Roles": ["admin"]})
+
+# 账号名总是采用向导值；密码留空表示保持不变
+if os.environ.get("NEW_USER"):
+    users[0]["Username"] = os.environ["NEW_USER"]
+if os.environ.get("NEW_PASS"):
+    # 写入明文密码即可：上游启动时会自动转成 PBKDF2 哈希
+    users[0]["Password"] = os.environ["NEW_PASS"]
+    users[0].pop("PasswordHash", None)
+
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(cfg, fh, ensure_ascii=False, indent=2)
+PYEOF
+        if [ $? -eq 0 ]; then
+            chmod 600 "${CFG_FILE}" 2>/dev/null || true
+            log_msg "Config.json credentials updated from wizard"
+        else
+            log_msg "WARN: failed to update Config.json credentials"
+        fi
+    else
+        log_msg "WARN: python3 unavailable, wizard credential change skipped"
+    fi
+fi
+
+# 重新启动，让端口等配置生效（cmd/main 会同步派生字段）
+if [ -x "${TRIM_APPDEST:-}/cmd/main" ]; then
+    "${TRIM_APPDEST}/cmd/main" start >> "${PKGVAR}/logs/Router2API.log" 2>&1 || true
+fi
+
+exit 0

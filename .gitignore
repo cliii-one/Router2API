@@ -1,0 +1,10 @@
+# 构建产物（CI 上生成，不入库）
+stage/
+*.fpk
+artifacts/
+upstream/
+
+# 本地临时文件
+*.log
+*.pid
+.DS_Store

@@ -1,0 +1,19 @@
+#!/bin/bash
+# 卸载后：清理残留进程
+# 刻意不删除 var 目录下的数据，便于用户误卸载后重新安装找回数据；
+# 飞牛在卸载时按自身策略处理应用数据目录。
+
+set -u
+
+PKGVAR="${TRIM_PKGVAR:-}"
+
+for f in "${PKGVAR}/router2api.pid" "${PKGVAR}/redis.pid"; do
+    [ -f "${f}" ] || continue
+    pid=$(head -n 1 "${f}" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+        kill -KILL "${pid}" 2>/dev/null || true
+    fi
+    rm -f "${f}" 2>/dev/null || true
+done
+
+exit 0

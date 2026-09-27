@@ -1,0 +1,24 @@
+#!/bin/bash
+# 升级前：停止旧版本，保证文件替换时没有进程占用
+# 升级过程中用户数据（var 目录）与 Config.json 都会保留
+
+set -u
+
+PKGVAR="${TRIM_PKGVAR:-}"
+
+# 优先用应用自身的 main 脚本优雅停止
+if [ -x "${TRIM_APPDEST:-}/cmd/main" ]; then
+    "${TRIM_APPDEST}/cmd/main" stop >> "${PKGVAR}/logs/Router2API.log" 2>&1 || true
+else
+    # 兜底：按 PID 文件停止
+    for f in "${PKGVAR}/router2api.pid" "${PKGVAR}/redis.pid"; do
+        [ -f "${f}" ] || continue
+        pid=$(head -n 1 "${f}" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+            kill -TERM "${pid}" 2>/dev/null || true
+        fi
+    done
+    sleep 3
+fi
+
+exit 0

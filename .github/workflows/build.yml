@@ -1,0 +1,291 @@
+# =============================================================
+# Router2API for fnOS - GitHub Actions 自动打包
+#
+# 全程在 GitHub 服务器构建，NAS 本机零负担。
+#
+# 触发方式：
+#   1. 手动触发（workflow_dispatch）：可指定上游 ref 与强制发布
+#   2. 定时检查（schedule）：每天检查上游是否发新版，有新版才构建
+#   3. push 到本仓库 main（改了打包脚本时立即重新出包）
+#
+# 流程：拉上游源码 → pnpm 构建前端 → dotnet 自包含发布宿主
+#      → 下载 Debian Redis 二进制 → 组装应用壳 → fnpack 打包
+#      → 上传 artifact + 发布 GitHub Release
+#
+# 产物：Router2API_v<版本>_arm64.fpk / _amd64.fpk
+#      （.NET 自包含发布必须按架构分开出包）
+# =============================================================
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+      - "docs/**"
+      - "**.md"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "上游 NNNNolan/Router2API 的分支/标签"
+        required: false
+        default: "main"
+      force_release:
+        description: "即使版本已发布过也强制重新构建"
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    # 每天 UTC 20:00（北京时间次日凌晨 4 点）检查上游更新
+    - cron: "0 20 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  # -----------------------------------------------------------
+  # 第一步：确定上游版本号，并判断是否需要构建
+  # -----------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Checkout 上游 Router2API（读取版本号）
+        uses: actions/checkout@v4
+        with:
+          repository: NNNNolan/Router2API
+          ref: ${{ inputs.upstream_ref || 'main' }}
+          path: upstream
+          fetch-depth: 1
+
+      - name: 读取上游版本号
+        id: ver
+        run: |
+          # 上游把版本号声明在 Router.Contracts.csproj 的 <Version> 里。
+          # 若上游改成别的写法，这里会回退到日期版本，保证构建不中断。
+          VERSION=$(grep -oPm1 '(?<=<Version>)[^<]+' upstream/src/Router.Contracts/Router.Contracts.csproj || true)
+          if [ -z "${VERSION}" ]; then
+            echo "::warning::未能从 csproj 读取版本号，回退到日期版本"
+            VERSION="0.0.$(date -u +%Y%m%d)"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "上游版本: ${VERSION}"
+
+      - name: 判断是否需要构建
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force_release || 'false' }}
+        run: |
+          # 仅定时任务做“版本未变则跳过”检查。
+          # push / 手动触发一律构建：打包脚本本身可能改了，需要重新出包。
+          if [ "${EVENT}" = "schedule" ] && [ "${FORCE}" != "true" ]; then
+            if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "定时任务：v${VERSION} 已发布过，跳过构建"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+  # -----------------------------------------------------------
+  # 第二步：按架构并行构建 fpk
+  #   用原生 arm64 / x64 runner，避免交叉编译带来的原生依赖问题
+  # -----------------------------------------------------------
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 公共仓库的 arm64 runner 免费，直接原生构建
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+          - runner: ubuntu-latest
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout 本仓库（应用壳与打包脚本）
+        uses: actions/checkout@v4
+
+      - name: Checkout 上游 Router2API
+        uses: actions/checkout@v4
+        with:
+          repository: NNNNolan/Router2API
+          ref: ${{ inputs.upstream_ref || 'main' }}
+          path: upstream
+          fetch-depth: 1
+
+      - name: 安装 .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: 安装 Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: 启用 corepack（使用上游声明的 pnpm 版本）
+        run: corepack enable
+
+      - name: 安装 fnpack（飞牛官方打包工具）
+        run: |
+          # arm64 官方最高 1.2.1，amd64 用 1.2.3
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            FNPACK_URL="https://static2.fnnas.com/fnpack/fnpack-1.2.1-linux-arm64"
+          else
+            FNPACK_URL="https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64"
+          fi
+          curl -sfL --retry 3 -o /tmp/fnpack "${FNPACK_URL}"
+          chmod +x /tmp/fnpack
+          sudo mv /tmp/fnpack /usr/local/bin/fnpack
+          fnpack 2>&1 | grep -i version || true
+
+      - name: 组装 fnOS 应用目录
+        env:
+          R2A_VERSION: ${{ needs.prepare.outputs.version }}
+          R2A_ARCH: ${{ matrix.arch }}
+        run: |
+          STAGE_DIR="${GITHUB_WORKSPACE}/stage" \
+          UPSTREAM_DIR="${GITHUB_WORKSPACE}/upstream" \
+          R2A_VERSION="${R2A_VERSION}" \
+          R2A_ARCH="${R2A_ARCH}" \
+            bash scripts/assemble.sh
+
+      - name: 生成校验和清单
+        # always：无论组装成功与否都输出包体状态，
+        # 失败时能直接从日志看出是哪一步没产出文件
+        if: always()
+        run: |
+          {
+            echo "架构: ${{ matrix.arch }}"
+            echo "版本: ${{ needs.prepare.outputs.version }}"
+            echo
+            echo "== 包根目录 =="
+            ls -la stage/Router2API/ 2>&1 || true
+            echo
+            echo "== app/ 结构 =="
+            ls -la stage/Router2API/app/ 2>&1 || true
+            echo
+            echo "== 体积 =="
+            du -sh stage/Router2API/app/host stage/Router2API/app/redis 2>&1 || true
+            echo
+            echo "== 关键文件是否存在 =="
+            for f in stage/Router2API/manifest \
+                     stage/Router2API/app/host/Router.Host \
+                     stage/Router2API/app/host/Router.Host.dll \
+                     stage/Router2API/app/host/wwwroot/index.html \
+                     stage/Router2API/app/redis/redis-server \
+                     stage/Router2API/app/redis/lib/liblzf.so.1; do
+              if [ -e "${f}" ]; then echo "  OK   ${f}"; else echo "  缺失 ${f}"; fi
+            done
+            echo
+            echo "== 包内软链（应为 0）=="
+            find stage/Router2API/app -type l 2>/dev/null | wc -l
+          } | tee assemble-report.txt
+
+      - name: fnpack 打包
+        env:
+          R2A_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          cd stage/Router2API
+          fnpack build
+          # fnpack 固定输出 Router2API.fpk（不含版本号），手动加版本与架构后缀
+          FPK=$(ls *.fpk | head -1)
+          OUT="${GITHUB_WORKSPACE}/Router2API_v${R2A_VERSION}_${{ matrix.arch }}.fpk"
+          mv "${FPK}" "${OUT}"
+          ls -la "${OUT}"
+          echo "FPK_PATH=${OUT}" >> "$GITHUB_ENV"
+
+      - name: 上传构建产物 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Router2API_v${{ needs.prepare.outputs.version }}_${{ matrix.arch }}
+          path: Router2API_v${{ needs.prepare.outputs.version }}_${{ matrix.arch }}.fpk
+          if-no-files-found: error
+
+  # -----------------------------------------------------------
+  # 第三步：发布 Release（等两个架构都构建成功后再发）
+  # -----------------------------------------------------------
+  release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 列出产物
+        run: ls -la artifacts/
+
+      - name: 生成 Release 说明
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          # 注意：heredoc 不加引号，让 ${VERSION} 正常展开
+          cat > release-notes.md <<NOTES
+          Router2API v${VERSION} 飞牛 fnOS 原生应用包（非 Docker）。
+
+          **上游项目**：https://github.com/NNNNolan/Router2API
+          **本次基于上游版本**：v${VERSION}
+
+          ## 安装方式
+
+          1. 下载对应架构的 fpk：
+             - \`Router2API_v${VERSION}_arm64.fpk\` —— ARM 架构 NAS
+             - \`Router2API_v${VERSION}_amd64.fpk\` —— x86_64 架构 NAS
+          2. 飞牛桌面 → 应用中心 → 手动安装 → 上传该文件
+          3. 安装向导中设置端口、管理员账号密码、API Key
+          4. 装好后点桌面 Router2API 图标，或浏览器访问 \`http://<NAS地址>:<端口>/\`
+
+          ## 特性
+
+          - **非 Docker**：.NET 10 自包含发布 + 包内自带 Redis，不依赖任何运行时
+          - **零外部依赖**：不需要在应用中心额外安装 dotnet 或 redis
+          - **数据持久化**：配置、数据库、插件都在应用的 var 目录，升级不丢
+
+          ## 升级说明
+
+          直接覆盖安装即可，管理员密码、API Key、数据库与已装插件都会保留。
+
+          ## 重要提醒
+
+          - 首次安装若未填写管理员密码，会自动生成随机密码，保存在应用数据目录的
+            \`initial-credentials.txt\`，请登录后尽快修改密码并删除该文件。
+          - 应用默认监听 \`0.0.0.0\`，局域网内可直接访问。若需公网暴露，
+            请自行在前面加一层反向代理并启用 HTTPS。
+          - \`Config/Config.json\` 的优先级高于环境变量；在管理后台改的配置会落盘保存。
+          NOTES
+
+      - name: 发布或更新 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          shopt -s nullglob
+          ASSETS=(artifacts/*.fpk)
+          if [ ${#ASSETS[@]} -eq 0 ]; then
+            echo "::error::没有找到任何 fpk 产物"
+            exit 1
+          fi
+
+          if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v${VERSION} 已存在，更新资产"
+            gh release upload "v${VERSION}" --repo "$GITHUB_REPOSITORY" --clobber "${ASSETS[@]}"
+            gh release edit "v${VERSION}" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md
+          else
+            gh release create "v${VERSION}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Router2API v${VERSION} for fnOS" \
+              --notes-file release-notes.md \
+              "${ASSETS[@]}"
+          fi

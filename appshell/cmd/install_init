@@ -1,0 +1,34 @@
+#!/bin/bash
+# 安装前检查：确认端口可用、包体完整
+# 出错时写入 TRIM_TEMP_LOGFILE，安装界面会展示给用户
+
+set -u
+
+APPDEST="${TRIM_APPDEST:-}"
+PKGVAR="${TRIM_PKGVAR:-}"
+
+fail() {
+    echo "$1" >&2
+    [ -n "${TRIM_TEMP_LOGFILE:-}" ] && echo "$1" >> "${TRIM_TEMP_LOGFILE}" 2>/dev/null
+    exit 1
+}
+
+[ -n "${APPDEST}" ] || fail "✗ 安装环境异常：未获取到应用目录（TRIM_APPDEST）"
+
+# 包体完整性：主程序与 Redis 必须存在
+[ -f "${APPDEST}/host/Router.Host.dll" ] || fail "✗ 安装包不完整：缺少主程序，请重新下载 fpk。"
+[ -x "${APPDEST}/redis/redis-server" ] || fail "✗ 安装包不完整：缺少 Redis 组件，请重新下载 fpk。"
+
+# 端口占用预检：向导端口若已被占用，提前告知，避免装完打不开
+PORT="${wizard_port:-${TRIM_SERVICE_PORT:-5242}}"
+case "${PORT}" in
+    ''|*[!0-9]*) PORT=5242 ;;
+esac
+
+if command -v ss >/dev/null 2>&1; then
+    if ss -tln 2>/dev/null | grep -qE ":${PORT}[[:space:]]"; then
+        fail "✗ 端口 ${PORT} 已被占用，请在安装向导中更换端口。"
+    fi
+fi
+
+exit 0
