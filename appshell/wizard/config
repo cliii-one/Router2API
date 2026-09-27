@@ -1,0 +1,54 @@
+[
+  {
+    "stepTitle": "服务配置",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_port",
+        "label": "服务端口",
+        "initValue": "5242",
+        "rules": [
+          { "required": true, "message": "请输入端口" },
+          { "pattern": "^[0-9]+$", "message": "仅支持数字" },
+          { "pattern": "^(?:[1-9][0-9]{2,4})$", "message": "请输入 100-65535 之间的端口" }
+        ]
+      },
+      {
+        "type": "tips",
+        "helpText": "修改端口后应用会自动重启。Redis 端口会跟着变成「主端口 + 10000」。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "管理后台凭据（留空即保持不变）",
+    "items": [
+      {
+        "type": "text",
+        "field": "wizard_admin_username",
+        "label": "管理员账号",
+        "initValue": "",
+        "rules": []
+      },
+      {
+        "type": "password",
+        "field": "wizard_admin_password",
+        "label": "管理员密码",
+        "initValue": "",
+        "rules": []
+      },
+      {
+        "type": "tips",
+        "helpText": "两项都留空就不会改动任何东西——这是默认情况，直接保存即可。只有确实要重置账号或密码时才填写，填写后应用会重启。日常修改密码建议直接在管理后台「设置」页操作。"
+      }
+    ]
+  },
+  {
+    "stepTitle": "插件目录权限说明",
+    "items": [
+      {
+        "type": "tips",
+        "helpText": "手动放插件时请注意目录属主：应用以专用用户（Router2API）运行，只能读取属主为 Router2API 的插件目录。经文件管理或 SMB 拷贝进来的插件通常属主是你自己的账号，应用读不了会导致插件无法加载。放好后请把插件目录属主改为 Router2API、权限设为 755。"
+      }
+    ]
+  }
+]

@@ -257,8 +257,8 @@ host_running() {
 # 所以必须落盘到文件，否则用户后续在后台改了密码会被环境变量覆盖。
 #
 # 文件里的字段分两类，处理策略不同：
-#   【凭据类】管理员账号/密码、API Key —— 只在安装向导填了值时才改，
-#             否则会覆盖用户在管理后台改过的密码。
+#   【凭据类】管理员账号/密码、API Key —— 一旦写入就不再自动改动，
+#             避免覆盖用户在管理后台改过的密码。
 #   【派生类】数据库路径、Redis 连接串 —— 由 PKGVAR 和端口推导而来。
 #             换存储空间或改端口后必须跟着变，所以每次启动都自愈。
 # =============================================================
@@ -268,30 +268,59 @@ config_file_path() {
     printf '%s' "${WORK_DIR}/Config/Config.json"
 }
 
-# 首次安装建配置；已有配置则只在向导提供了新凭据时更新凭据
+# 首次安装建配置；已有配置则只在**凭据缺失**时才补写。
 #
 # 首次安装的账号密码固定为 admin / admin，方便装完直接登录。
 # 注意：这是弱密码，仅适合内网使用；登录后请立刻在管理后台改掉。
+#
+# ⚠️ 一条硬规则：配置已存在且凭据齐全时，**永远不重写凭据**。
+#    原因（实测踩坑）：飞牛会把安装向导填的值作为环境变量在**每次启动**都传进来。
+#    如果据此判断"用户要改配置"，就会每次重启都覆盖一遍，
+#    把用户在管理后台改过的密码冲回初始值
+#    （日志实证：5 次启动、5 次 "Config.json written"、0 次 "kept"）。
+#    要改凭据请走"应用设置"（config_callback 会明确处理），不靠重启时的环境变量猜。
 ensure_config() {
     local cfg_dir="${WORK_DIR}/Config"
     local cfg_file
     cfg_file=$(config_file_path)
     mkdir -p "${cfg_dir}" 2>/dev/null || true
 
-    local admin_user="${wizard_admin_username:-admin}"
-    local admin_pass="${wizard_admin_password:-admin}"
+    local admin_user="${wizard_admin_username:-}"
+    local admin_pass="${wizard_admin_password:-}"
     local api_key="${wizard_api_key:-}"
 
-    # 没有新凭据要写：仅保证文件存在，其余交给 sync_derived_config
-    if [ -f "${cfg_file}" ] && [ -z "${wizard_admin_password:-}" ] \
-       && [ -z "${wizard_admin_username:-}" ] && [ -z "${api_key}" ]; then
-        log_msg "Existing Config.json kept (no new credentials from wizard)"
-        return 0
-    fi
+    # ---------- 已有配置 ----------
+    if [ -f "${cfg_file}" ]; then
+        local need_user="" need_pass="" need_key=""
 
-    # 首次安装且没给 API Key：按上游格式生成 sk-router- + 48 位十六进制
-    if [ -z "${api_key}" ] && [ ! -f "${cfg_file}" ]; then
-        api_key="sk-router-$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        # 只补"缺什么"，不动"有什么"
+        if ! config_has_key "${cfg_file}" "Auth.Admin.Users.0.Username"; then
+            need_user="yes"
+            [ -n "${admin_user}" ] || admin_user="admin"
+        fi
+        # 密码：明文和哈希都没有才算缺失
+        if ! config_has_key "${cfg_file}" "Auth.Admin.Users.0.Password" \
+           && ! config_has_key "${cfg_file}" "Auth.Admin.Users.0.PasswordHash"; then
+            need_pass="yes"
+            [ -n "${admin_pass}" ] || admin_pass="admin"
+        fi
+        if ! config_has_key "${cfg_file}" "Auth.ApiKey.Key"; then
+            need_key="yes"
+            [ -n "${api_key}" ] || api_key="sk-router-$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        fi
+
+        if [ -z "${need_user}${need_pass}${need_key}" ]; then
+            log_msg "Config.json kept (credentials already present)"
+            return 0
+        fi
+        log_msg "Config.json missing credentials (user=${need_user:-no} pass=${need_pass:-no} key=${need_key:-no}); filling in"
+        [ -n "${admin_user}" ] || admin_user="admin"
+    else
+        # ---------- 首次安装：套用默认值 ----------
+        [ -n "${admin_user}" ] || admin_user="admin"
+        [ -n "${admin_pass}" ] || admin_pass="admin"
+        # API Key 没填就按上游格式生成 sk-router- + 48 位十六进制
+        [ -n "${api_key}" ] || api_key="sk-router-$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
     fi
 
     if ! write_config "${cfg_file}" "${admin_user}" "${admin_pass}" "${api_key}"; then
@@ -302,6 +331,23 @@ ensure_config() {
 
     log_msg "Config.json written (admin=${admin_user}, redis=127.0.0.1:${REDIS_PORT})"
     return 0
+}
+
+# 判断配置里某个点分路径是否存在且非空
+config_has_key() {
+    local cfg_file="$1" dotted="$2"
+    command -v python3 >/dev/null 2>&1 || return 0   # 没有 python 时保守认为"已存在"，不重写
+    CFG_FILE="${cfg_file}" CFG_PATH="${dotted}" python3 - <<'PYEOF' 2>/dev/null
+import json, os, sys
+try:
+    with open(os.environ["CFG_FILE"], encoding="utf-8") as fh:
+        node = json.load(fh)
+    for part in os.environ["CFG_PATH"].split("."):
+        node = node[int(part)] if part.isdigit() else node[part]
+except Exception:
+    sys.exit(1)          # 取不到 → 视为缺失
+sys.exit(0 if node not in (None, "", []) else 1)
+PYEOF
 }
 
 # 写配置文件。已有文件时是"合并更新"，不丢掉用户自己加的字段。
@@ -498,6 +544,77 @@ ensure_plugins_link() {
 }
 
 # =============================================================
+# 隔离"读不了"的插件目录（防止宿主启动即崩）
+#
+# 背景（实测踩坑）：
+#   用户通过飞牛文件管理/SMB 把插件目录放进 plugins/ 时，目录属主是 NAS 用户
+#   （如 dinding），权限常是 711 —— 对"非属主"只有 --x：能进入、不能读。
+#   宿主以应用用户（Router2API）运行，枚举这些目录时抛
+#   UnauthorizedAccessException；上游这里没做异常保护，进程直接退出，
+#   表现就是"放了插件就启动不了"。
+#
+# 做法：启动前扫一遍 plugins/，凡是当前用户读不了的目录，移动到
+#   plugins/.skipped/ 下（点开头目录上游会忽略），并在日志里给出明确指引。
+#   注意：移动只需父目录可写，与目标目录自身权限无关（已实测验证）。
+#   如果连移动都失败（极端情况），退而求其次——直接记日志告知用户。
+# =============================================================
+quarantine_unreadable_plugins() {
+    local dir="${1:-}"
+    [ -d "${dir}" ] || return 0
+
+    local skipped_dir="${dir}/.skipped"
+    local quarantined=0 entry name
+
+    # 先看有没有"改好权限"的插件可以放回来（用户按提示修完属主后重启即可自动恢复）
+    if [ -d "${skipped_dir}" ]; then
+        for entry in "${skipped_dir}"/*; do
+            [ -e "${entry}" ] || continue
+            name=$(basename "${entry}")
+            if ls -A "${entry}" >/dev/null 2>&1; then
+                if mv "${entry}" "${dir}/${name}" 2>/dev/null; then
+                    log_msg "Restored plugin '${name}' from .skipped/ (permission fixed)"
+                fi
+            fi
+        done
+        rmdir "${skipped_dir}" 2>/dev/null || true
+    fi
+
+    # 再尝试修复权限（属主是自己时有效），仍读不了的移走
+    for entry in "${dir}"/*; do
+        [ -e "${entry}" ] || continue
+        name=$(basename "${entry}")
+        # 跳过以 . 开头的内部目录（上游本来就不当插件看待）
+        case "${name}" in .*) continue ;; esac
+
+        if [ -d "${entry}" ] && ! ls -A "${entry}" >/dev/null 2>&1; then
+            # 它是我们自己的目录的话，补上读权限就能救回来
+            if [ -O "${entry}" ]; then
+                chmod u+rwX "${entry}" 2>/dev/null || true
+            fi
+            if ls -A "${entry}" >/dev/null 2>&1; then
+                log_msg "Fixed permission of plugin '${name}'"
+                continue
+            fi
+            # 救不回来：移走，保证宿主能正常启动
+            [ -d "${skipped_dir}" ] || mkdir -p "${skipped_dir}" 2>/dev/null || true
+            if mv "${entry}" "${skipped_dir}/${name}" 2>/dev/null; then
+                quarantined=$((quarantined + 1))
+                log_msg "Quarantined unreadable plugin '${name}' -> .skipped/ (permission denied)"
+            else
+                log_msg "ERROR: plugin '${name}' is unreadable and cannot be moved aside"
+            fi
+        fi
+    done
+
+    if [ "${quarantined}" -gt 0 ]; then
+        user_error "⚠ 有 ${quarantined} 个插件目录当前用户读不了，已临时停用（移到 plugins/.skipped）。"
+        user_error "  原因是这些目录属主不是应用用户（通常是经文件管理/SMB 放入的）。"
+        user_error "  解决办法：把这些插件目录的属主改成 ${TRIM_USERNAME:-Router2API}，权限设为 755，再重启应用。"
+    fi
+    return 0
+}
+
+# =============================================================
 # 同步桌面入口端口
 #
 # 飞牛读 target/ui/config 里的 port 来生成桌面入口和 iframe 地址。
@@ -545,6 +662,8 @@ start_host() {
     # 插件目录持久化：上游固定读「程序目录/plugins」，
     # 这里把它软链到 var/plugins，升级替换 target 时插件不会丢。
     ensure_plugins_link || return 1
+    # 隔离读不了的插件目录：否则宿主枚举时会抛未捕获异常直接退出
+    quarantine_unreadable_plugins "${PERSIST_PLUGINS_DIR}"
 
     # 关键：切换到 WORK_DIR，让上游按预期解析 Config/ 与 data/
     cd "${WORK_DIR}" || return 1

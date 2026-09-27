@@ -277,6 +277,8 @@ check_file "${APP_CONTENT}/redis/lib/liblzf.so.1"
 check_file "${APP_CONTENT}/redis/lib/libjemalloc.so.2"
 check_file "${APP_CONTENT}/ui/config"
 check_file "${APP_PKG}/wizard/install"
+check_file "${APP_PKG}/wizard/upgrade"
+check_file "${APP_PKG}/wizard/config"
 check_file "${APP_PKG}/config/privilege"
 check_file "${APP_PKG}/config/resource"
 [ -d "${APP_PKG}/cmd" ] || { echo "FATAL: 缺少 cmd/" >&2; fail=1; }

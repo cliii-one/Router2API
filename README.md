@@ -129,10 +129,29 @@ flowchart TD
 |------|----------|
 | 启动失败：主程序缺失 | fpk 里的 `app/host` 没打进去，看 CI 的 assemble 日志 |
 | 启动失败：Redis 启动失败 | 看 `<var>/logs/redis.log`；确认架构匹配（arm64/x86 别装错） |
+| **放了插件后起不来** | 插件目录属主不是应用用户，读不了。把属主改成 `Router2API`、权限设 755；读不了的插件会被自动移到 `<var>/plugins/.skipped`，改好权限重启会自动放回 |
 | 端口被占用 | 应用设置里换端口，或在飞牛里查谁占了端口 |
 | 页面打开空白 | 确认 `cmd/main status` 是运行中；看日志有没有异常 |
 | 忘了管理员密码 | 删掉 `<var>/Config/Config.json` 重启，会重置为默认 admin/admin |
+| 后台改的密码重启后失效 | 已修复：配置有凭据时不再重写。若仍复现请看日志有没有 `Config.json written` |
 | 想重置 API Key | 管理后台「设置」页可查看与重置 |
+
+### 手动放插件（重要）
+
+应用以专用用户 `Router2API` 运行，**只能读取属主为 `Router2API` 的插件目录**。
+经文件管理或 SMB 拷进去的插件，属主通常是你自己的账号，应用读不了。
+
+放好后执行（把路径换成你的插件目录名）：
+
+```bash
+chown -R Router2API:Router2API /vol2/@appdata/Router2API/plugins/你的插件
+chmod -R 755 /vol2/@appdata/Router2API/plugins/你的插件
+```
+
+然后重启应用。如果之前因为权限问题被停用，重启时会自动恢复。
+
+> 更省事的办法：直接在管理后台「插件」页从 GitHub 仓库安装，
+> 由应用自己下载解包，权限天然正确，不会踩这个坑。
 
 ## 授权
 

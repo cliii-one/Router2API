@@ -327,22 +327,46 @@ flowchart LR
 
 | 场景 | 行为 |
 |------|------|
-| 向导没填、且是首次安装 | 用 **admin / admin** |
-| 向导填了密码 | 用向导的值 |
-| 向导没填、但已存在配置 | 不动原配置（保留既有密码/哈希） |
+| 配置不存在（首次安装） | 写 **admin / admin** + 自动生成 API Key |
+| 配置已存在、凭据齐全 | **完全不碰**（关键，见下） |
+| 配置存在但缺某个凭据 | 只补缺的那一项 |
 | API Key | 没填就按上游格式生成 `sk-router-<48位十六进制>` |
 
-**为什么默认给 admin/admin，而不是随机密码：**
+**为什么默认给 admin/admin：** 装完就能直接登录，不用去应用数据目录翻密码文件。
 
-装完就能直接登录，不用先去应用数据目录翻密码文件，体验最顺。
-代价是弱密码，所以：
+### 一条硬规则：配置已有凭据时永不重写（实测踩坑）
 
-- 安装向导里已经把这项**明示**给用户（"默认都是 admin，仅适合内网，登录后请立刻修改"）
-- 升级时留空表示"保持不变"，**不会**把用户改过的密码重置回 admin
-- 用户在管理后台改完密码会存成 PBKDF2 哈希，本逻辑不碰它
+一开始我按"向导传了值就更新配置"来实现，结果**用户改的密码每次重启都被冲回 admin**。
 
-> 如果哪天想改回随机密码或换别的默认值，只改 `ensure_config` 里
-> `admin_pass="${wizard_admin_password:-admin}"` 这一行的默认值即可。
+原因：飞牛会把安装向导填的值作为环境变量，**在每次启动都传进来**：
+
+```
+TRIM_APP_START 时 → wizard_admin_username=admin, wizard_admin_password=admin
+```
+
+所以"环境变量里有值"根本不能说明"用户想改配置"。
+日志里的实证非常直白：**5 次启动、5 次 `Config.json written`、0 次 `kept`**。
+
+我试过用"凭据指纹比对"来绕过，但也失败了——首次安装时向导值为空，
+指纹记的是空值；之后每次启动传入 `admin/admin`，指纹必然"变化"，
+于是又被判定成"用户改配置"。**指纹方案从根上就不可靠。**
+
+最终采用最简单也最稳的规则：
+
+```mermaid
+flowchart TD
+    A["启动 ensure_config"] --> B{"Config.json 存在?"}
+    B -->|否| C["首装：写 admin/admin + 生成 Key"]
+    B -->|是| D{"凭据字段齐全?"}
+    D -->|是| E["什么都不做<br/>（用户改的密码安全）"]
+    D -->|否| F["只补缺失的那一项"]
+```
+
+判断"齐全"用 `config_has_key` 检查点分路径，密码会同时看
+`Password`（明文）和 `PasswordHash`（哈希）两个字段——只要有一个就算有。
+
+> 要主动改凭据，请走**应用设置**（`wizard/config` + `config_callback`），
+> 那里密码留空就是"不改"，语义明确，不靠猜。
 
 配置用 python 写 JSON（正确处理密码里的引号、反斜杠），
 没有 python 时退回转义后手写 JSON。
@@ -350,6 +374,62 @@ flowchart LR
 > 配置落盘到 `Config/Config.json` 而不是只给环境变量，是因为上游的
 > 优先级是 `Config.json > User Secrets > 环境变量`。
 > 如果只用环境变量，用户在管理后台改了密码，重启后会被旧的环境变量覆盖。
+
+## 插件目录权限（放插件就起不来，真实踩坑）
+
+用户在插件目录里放了插件后，应用**启动即崩**：
+
+```
+Unhandled exception. System.UnauthorizedAccessException:
+Access to the path '/vol2/@appcenter/Router2API/host/plugins/workbuddy' is denied.
+```
+
+### 根因：属主不是应用用户
+
+用 `stat` 一看就清楚：
+
+```
+workbuddy  mode=711 owner=dinding:root
+opencode   mode=711 owner=dinding:root
+```
+
+`711` 的含义是「属主 rwx，其他人只有 `--x`」——**能进入目录，但不能读内容**。
+而宿主以专用用户 `Router2API` 运行，对 `dinding` 的目录来说它属于"其他人"，
+只能 `--x`，于是 `Directory.EnumerateFiles` 抛异常。
+
+**为什么上游会直接崩**：`PluginCatalog.LoadDirectoryAsync` 调
+`DotNetPackageLoader.FindMainAssembly` 时没做异常保护，
+未捕获的 `UnauthorizedAccessException` 直接终止进程。
+
+**为什么权限是这样的**：用户通过飞牛文件管理 / SMB 拷进去的目录，
+属主自然是自己的账号，权限也由文件管理器的默认策略决定（711）。
+
+### 处理：启动前隔离读不了的插件
+
+`cmd/main` 在启动宿主前调用 `quarantine_unreadable_plugins`：
+
+1. **先尝试自救**：如果目录属主就是应用用户，补上 `u+rwX` 权限即可恢复
+2. **救不回来就隔离**：移动到 `plugins/.skipped/`（点开头目录上游会自动忽略），
+   保证宿主能正常启动，而不是整个崩掉
+3. **给出可操作的提示**：通过 `TRIM_TEMP_LOGFILE` 告诉用户改属主和权限
+4. **自动恢复**：下次启动时，`.skipped/` 里已修好权限的插件会自动移回原位
+
+> 实测确认：`mv` 一个目录只要求**父目录可写**，与目标目录自身权限无关，
+> 所以隔离操作在 `000/111/555/711` 各种权限下都成立。
+
+### 给用户的正确做法
+
+放插件后，把插件目录的属主改成应用用户、权限设为 755：
+
+```bash
+chown -R Router2API:Router2API /vol2/@appdata/Router2API/plugins/你的插件
+chmod -R 755 /vol2/@appdata/Router2API/plugins/你的插件
+```
+
+然后重启应用（或直接重启，会自动把 `.skipped` 里的插件放回来）。
+
+这条说明也写进了**应用设置向导**（`wizard/config`）的提示里，
+用户点开设置就能看到，不用去翻文档。
 
 ## 实测记录
 
