@@ -1,0 +1,515 @@
+<?xml version="1.0"?>
+<doc>
+    <assembly>
+        <name>Plugins.WorkBuddy</name>
+    </assembly>
+    <members>
+        <member name="T:Plugins.WorkBuddy.WorkBuddyTerminal">
+            <summary>
+            将 WorkBuddy / CodeBuddy OAuth 账号接入 Router2API 聊天终端。
+            插件负责 OAuth、账号持久化、协议转换和账号任务；宿主负责平台路由、策略执行和插件生命周期。
+            国内与国际账号共用平台标识，实际站点由 OAuth 返回的 domain 决定。
+            成长任务事件头与请求体按 MIT 参考项目 workbuddy2api-panel 的任务协议适配，参考版本为
+            dbd7c6800ed8071d7dd617d456b6041294781fee（https://github.com/linguo2625469/workbuddy2api-panel）。
+            上游内容策略误拦截时的中性 system prompt 单次重试也参考该版本的 handler.go 与 prompt.go。
+            WorkBuddy 请求兼容规则参考 xiaofan6ya/workbuddy2api upstream_compat.py，提交 bc173d82670dee4ef9761e78b274b7157ddb08b6。
+            空 function_call 与会话前缀粘性参考 ardeyouxipianyi/workbuddy2api-hub PR #4，合并提交 0914e4a4b0750c6e2cc8b62cbc70de822b1cebe2；参考仓库 main HEAD 为 650b65945e2772517ab3e8bd4dc30b57b0019461。
+            </summary>
+            <param name="host">提供账号存储、模型目录、HTTP 客户端、任务日志及其他宿主服务。</param>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RefreshAccountsTaskAsync(Router.Contracts.Plugins.PluginScheduledTaskContext)">
+            <summary>每小时调用宿主账号刷新流程，更新已保存且有 Refresh Token 的账号。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.KeepaliveTaskAsync(Router.Contracts.Plugins.PluginScheduledTaskContext)">
+            <summary>每天晚间刷新账号令牌，作为 WorkBuddy 账号保活任务。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.BalanceRefreshTaskAsync(Router.Contracts.Plugins.PluginScheduledTaskContext)">
+            <summary>每五分钟刷新所有可用账号的积分/套餐余额快照。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.DailyCheckinTaskAsync(Router.Contracts.Plugins.PluginScheduledTaskContext)">
+            <summary>每天两次为国内站账号调用官方签到接口；国际账号会被跳过。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ActivityTaskAsync(Router.Contracts.Plugins.PluginScheduledTaskContext)">
+            <summary>每天为国内站账号上报一次对话活跃事件。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.TravelTaskAsync(Router.Contracts.Plugins.PluginScheduledTaskContext)">
+            <summary>每天为国内站账号执行 Buddy 领养、旅行和领奖流程。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.GrowthTasksTaskAsync(Router.Contracts.Plugins.PluginScheduledTaskContext)">
+            <summary>接受国内站账号当前可执行的成长任务，并领取已完成任务奖励。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.StreakRewardsTaskAsync(Router.Contracts.Plugins.PluginScheduledTaskContext)">
+            <summary>为国内站账号兑换已解锁的连续签到档位并领取可用奖励。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.NightTasksTaskAsync(Router.Contracts.Plugins.PluginScheduledTaskContext)">
+            <summary>执行国内站夜间对话任务，补足前一晚 23:00 至当日 08:00 的任务量。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RefreshAccountsCoreAsync(System.String,System.Threading.CancellationToken)">
+            <summary>刷新有 Refresh Token 的账号，并把调用方任务 ID 写入任务日志。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RefreshBalancesCoreAsync(System.Threading.CancellationToken)">
+            <summary>对每个具备可用凭据的账号读取并缓存当前积分余额。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RefreshBalanceForAccountAsync(Router.Contracts.Domain.Account,Router.Contracts.Domain.OAuthCredential,System.Threading.CancellationToken)">
+            <summary>与后台同步共用账号级单次读取；取消等待不会中断其他调用仍在共享的读取。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.QueueBalanceRefresh(Router.Contracts.Domain.Account,System.Boolean)">
+            <summary>新增账号、启动预热和缓存缺失时后台同步；按账号去重，最多四个实际查询。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.GetPreferredCreditExpiry(Router.Contracts.Domain.Account)">
+            <summary>仅用仍有余额且未过期的积分包排序；获取不到明细时保留原有会话粘性兜底。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RefreshIfNeededAsync(Router.Contracts.Domain.Account,Router.Contracts.Domain.OAuthCredential,System.Threading.CancellationToken)">
+            <summary>仅当访问令牌已过期或将在刷新缓冲期内过期时尝试续期；续期失败仍返回原账号。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RefreshSavedAccountAsync(Router.Contracts.Domain.Account,System.Threading.CancellationToken)">
+            <summary>通过宿主账号存储的并发安全刷新入口更新凭据，同时保留停用与积分冷却状态。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RecordSessionDeadFailureAsync(Router.Contracts.Domain.Account,System.Nullable{System.Int32},System.Threading.CancellationToken,System.Boolean)">
+            <summary>记录连续 WorkBuddy 12153 错误；第三次后由宿主持久化为永久停用。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ClearSessionDeadFailuresAsync(Router.Contracts.Domain.Account,System.Threading.CancellationToken)">
+            <summary>聊天成功后清除未达到停用阈值的 12153 连续失败计数。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RecoverCreditCooldownAsync(System.String,System.Threading.CancellationToken)">
+            <summary>仅在真实余额已恢复且账号仍为 Active 时自动解除积分冷却。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.NextLocalFourAm">
+            <summary>将硬积分耗尽冷却到宿主本地时区的下一个凌晨 04:00。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RefreshCredentialAsync(Router.Contracts.Domain.OAuthCredential,System.Threading.CancellationToken)">
+            <summary>调用官方刷新令牌接口，并将缺失的新字段回退到原有刷新令牌、域名和到期时间。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RunForAccountsAsync(System.Func{Router.Contracts.Domain.Account,Router.Contracts.Domain.OAuthCredential,System.Threading.CancellationToken,System.Threading.Tasks.Task},System.String,System.Boolean,System.Threading.CancellationToken,System.Func{Router.Contracts.Domain.OAuthCredential,System.Boolean})">
+            <summary>
+            按账号顺序运行指定任务，按凭据、站点区域及可选条件筛选账号；
+            单个账号失败会写日志并隔离，不会阻止后续账号执行。
+            </summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.WriteAccountTaskLogAsync(System.String,Router.Contracts.Domain.Account,System.String,System.String,System.DateTimeOffset,System.String,System.Object)">
+            <summary>记录单个账号任务的成功/失败、耗时及可选执行明细。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RunDailyCheckinAsync(Router.Contracts.Domain.Account,Router.Contracts.Domain.OAuthCredential,System.Threading.CancellationToken)">
+            <summary>调用账号所属国内/国际站对应的官方每日签到接口。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RunActivityAsync(Router.Contracts.Domain.Account,Router.Contracts.Domain.OAuthCredential,System.Threading.CancellationToken)">
+            <summary>通过官方活跃报告接口为账号提交一次对话活跃事件。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.SendActivityReportAsync(System.Net.Http.HttpClient,Router.Contracts.Domain.OAuthCredential,System.String,System.String,System.String,System.Threading.CancellationToken)">
+            <summary>构建并发送带稳定 trace ID 和账号信息的 WorkBuddy 活跃报告请求。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RunTravelAsync(Router.Contracts.Domain.Account,Router.Contracts.Domain.OAuthCredential,System.Threading.CancellationToken)">
+            <summary>依次读取 Buddy 旅行状态、推进旅行操作，并领取已经满足条件的奖励。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RunGrowthTasksAsync(Router.Contracts.Domain.Account,Router.Contracts.Domain.OAuthCredential,System.Threading.CancellationToken)">
+            <summary>读取可接受的成长任务，逐项接受并领取当前已完成的任务奖励。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RunStreakRewardsAsync(Router.Contracts.Domain.Account,Router.Contracts.Domain.OAuthCredential,System.Threading.CancellationToken)">
+            <summary>检查 7/14/28 日连登奖励状态，兑换可领取档位并执行可用抽奖。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RunNightTasksAsync(Router.Contracts.Domain.Account,Router.Contracts.Domain.OAuthCredential,System.Threading.CancellationToken)">
+            <summary>查询夜间任务进度，并通过受控对话请求补足目标任务量。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.#ctor(Router.Contracts.Host.IPluginHost)">
+            <summary>
+            将 WorkBuddy / CodeBuddy OAuth 账号接入 Router2API 聊天终端。
+            插件负责 OAuth、账号持久化、协议转换和账号任务；宿主负责平台路由、策略执行和插件生命周期。
+            国内与国际账号共用平台标识，实际站点由 OAuth 返回的 domain 决定。
+            成长任务事件头与请求体按 MIT 参考项目 workbuddy2api-panel 的任务协议适配，参考版本为
+            dbd7c6800ed8071d7dd617d456b6041294781fee（https://github.com/linguo2625469/workbuddy2api-panel）。
+            上游内容策略误拦截时的中性 system prompt 单次重试也参考该版本的 handler.go 与 prompt.go。
+            WorkBuddy 请求兼容规则参考 xiaofan6ya/workbuddy2api upstream_compat.py，提交 bc173d82670dee4ef9761e78b274b7157ddb08b6。
+            空 function_call 与会话前缀粘性参考 ardeyouxipianyi/workbuddy2api-hub PR #4，合并提交 0914e4a4b0750c6e2cc8b62cbc70de822b1cebe2；参考仓库 main HEAD 为 650b65945e2772517ab3e8bd4dc30b57b0019461。
+            </summary>
+            <param name="host">提供账号存储、模型目录、HTTP 客户端、任务日志及其他宿主服务。</param>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.GetModelsAsync(Router.Contracts.Domain.ModelQueryContext,System.Threading.CancellationToken)">
+            <summary>
+            按已登录的国内/国际账号分别发现模型，再按版本标记后合并返回。
+            </summary>
+            <param name="context">宿主模型目录提供的可复用 HTTP 客户端（如有）。</param>
+            <param name="cancellationToken">取消账号读取和上游模型查询的令牌。</param>
+            <returns>包含版本前缀并按显示名称和模型 ID 排序的模型目录。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ValidateCredentialAsync(Router.Contracts.Domain.Credential,System.Threading.CancellationToken)">
+            <summary>检查 OAuth 凭据是否至少包含访问令牌或刷新令牌；不在此方法内访问上游。</summary>
+            <param name="credential">宿主保存的 OAuth 凭据。</param>
+            <param name="cancellationToken">符合接口签名的取消令牌；本地格式检查不执行异步操作。</param>
+            <returns>凭据是否可用于请求或后续刷新。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.Configure(Router.Contracts.Plugins.IPluginBuilder)">
+            <summary>注册 OAuth 账号筛选、上游错误冷却和代理请求重试策略。</summary>
+            <param name="builder">宿主提供的插件策略注册器。</param>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.StartAsync(Router.Contracts.Plugins.PluginStartContext,System.Threading.CancellationToken)">
+            <summary>初始化登录会话，并在已有可用账号时预热平台模型目录。</summary>
+            <param name="context">插件启动信息。</param>
+            <param name="cancellationToken">取消启动阶段服务解析或模型预热的令牌。</param>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.StopAsync(System.Threading.CancellationToken)">
+            <summary>停止 OAuth 登录会话并取消、等待后台任务；已持久化账号凭据保留在宿主账号存储中。</summary>
+            <param name="cancellationToken">宿主停止流程的取消令牌。</param>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.DisposeAsync">
+            <summary>取消并等待插件拥有的后台工作，释放余额同步资源。</summary>
+            <returns>所有后台工作退出后的完成通知。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.StatusAsync(Router.Contracts.Host.PluginHttpContext)">
+            <summary>返回插件平台标识、当前账号数和未过期 OAuth 流程数。</summary>
+            <param name="context">管理员管理端点上下文。</param>
+            <returns>WorkBuddy 插件当前状态。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.AccountsAsync(Router.Contracts.Host.PluginHttpContext)">
+            <summary>列出管理页面所需的账号、站点、令牌到期和最近积分快照。</summary>
+            <param name="context">管理员管理端点上下文。</param>
+            <returns>账号视图数组；凭据 Token 不包含在返回结果中。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ModelsAsync(Router.Contracts.Host.PluginHttpContext)">
+            <summary>读取宿主模型目录中已缓存的 WorkBuddy 模型。</summary>
+            <param name="context">管理员管理端点上下文。</param>
+            <returns>管理页面展示格式的模型列表。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RefreshModelsAsync(Router.Contracts.Host.PluginHttpContext)">
+            <summary>强制刷新 WorkBuddy 模型目录并返回刷新后的完整列表。</summary>
+            <param name="context">管理员管理端点上下文。</param>
+            <returns>刷新后的模型列表和成功标志。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.StartOAuthAsync(Router.Contracts.Host.PluginHttpContext)">
+            <summary>为国内或国际站创建有时限的 OAuth 状态，并返回官方授权地址。</summary>
+            <param name="context">请求体可通过 `realm` 选择 `cn` 或 `global`。</param>
+            <returns>需在后续轮询中提交的 state、授权 URL 和规范化后的站点。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.PollOAuthAsync(Router.Contracts.Host.PluginHttpContext)">
+            <summary>
+            查询 OAuth 授权状态。授权完成后读取 UID 和账号信息，安全校验 UID，
+            再新增账号或按 UID 更新已有账号。
+            </summary>
+            <param name="context">查询字符串中必须包含由 `oauth/start` 返回的 state。</param>
+            <returns>等待状态或已保存账号的 ID、UID、昵称和令牌到期时间。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RefreshAccountsEndpointAsync(Router.Contracts.Host.PluginHttpContext)">
+            <summary>手动刷新可刷新的账号令牌，并立即刷新所有账号的积分余额。</summary>
+            <param name="context">管理员管理端点上下文。</param>
+            <returns>两个刷新流程都已被当前请求执行后的成功标志。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RunTaskEndpointAsync(Router.Contracts.Host.PluginHttpContext)">
+            <summary>启动指定 WorkBuddy 定时任务的后台执行，并立即返回任务 ID。</summary>
+            <param name="context">请求体中需包含已注册的 `task` ID。</param>
+            <returns>已接受的后台任务 ID 和当前状态。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ManualTaskRunStatusEndpointAsync(Router.Contracts.Host.PluginHttpContext)">
+            <summary>读取手动启动的 WorkBuddy 定时任务状态。</summary>
+            <param name="context">包含任务 ID 的管理端点上下文。</param>
+            <returns>后台任务状态和执行失败信息。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.CompleteGrowthTasksEndpointAsync(Router.Contracts.Host.PluginHttpContext)">
+            <summary>启动国内站成长任务后台执行，并立即返回任务 ID。</summary>
+            <param name="context">管理员管理端点上下文。</param>
+            <returns>已接受的后台任务 ID 和当前状态。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.GrowthTasksStatusEndpointAsync(Router.Contracts.Host.PluginHttpContext)">
+            <summary>读取成长任务一键执行的后台状态。</summary>
+            <param name="context">管理员管理端点上下文。</param>
+            <returns>最近一次执行的任务 ID、状态、开始/结束时间和失败信息。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.InvokeAsync(Router.Contracts.Domain.PluginAttemptContext)">
+            <summary>
+            刷新临近过期凭据，将标准聊天请求映射到 WorkBuddy Chat Completions，
+            并把普通或 SSE 上游响应转换为宿主标准响应。
+            </summary>
+            <param name="context">本次尝试的账号、请求、宿主管理的 HTTP 客户端、追踪信息和取消令牌。</param>
+            <returns>聊天响应以及宿主用于成功、重试、冷却账号/节点或停用账号的执行结果。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.TryLogAsync(System.String,System.String,System.String,System.String,System.String,System.String,System.String,System.Nullable{System.Int32},System.Nullable{System.Int32},System.Object)">
+            <summary>将 WorkBuddy 诊断事件写入宿主日志；日志服务故障不改变请求处理结果。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ActivateGlobalAccountAndClaimTrialAsync(Router.Contracts.Domain.OAuthCredential,System.Threading.CancellationToken)">
+            <summary>按 panel 的国际账号登录流程补全注册地区并尝试领取一次性 trial 加油包。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.GetMainPage">
+            <summary>
+            创建 WorkBuddy 管理页面，提供 OAuth 授权、账号/积分查看、模型刷新和任务快捷操作。
+            </summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.SendOAuthAsync(System.Net.Http.HttpMethod,System.String,System.String,System.Text.Json.Nodes.JsonNode,System.String,System.String,System.Threading.CancellationToken,System.Net.Http.HttpClient,Router.Contracts.Domain.OAuthCredential)">
+            <summary>发送 OAuth 状态、令牌、账号资料或刷新令牌请求，并统一解析官方响应包络。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.SendAccountJsonAsync(System.Net.Http.HttpClient,Router.Contracts.Domain.OAuthCredential,System.Net.Http.HttpMethod,System.String,System.Text.Json.Nodes.JsonNode,System.Threading.CancellationToken,System.Boolean,System.String)">
+            <summary>发送需要账号 OAuth 令牌的 JSON 业务请求；上游失败时抛出包含错误摘要的异常。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadUpstreamAsync(System.Net.Http.HttpClient,System.Net.Http.HttpRequestMessage,System.Threading.CancellationToken)">
+            <summary>
+            读取完整上游响应，兼容普通 JSON 和带 `code`/`data` 的业务包装；
+            HTTP 或业务错误保留原始消息供调用方记录。
+            </summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadCompletionAsync(System.Net.Http.HttpResponseMessage,System.String,Router.Contracts.Domain.Account,System.Threading.CancellationToken)">
+            <summary>聚合非流式 SSE/JSON 输出中的文本、推理、工具调用、结束原因和用量。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadStreamAsync(System.Net.Http.HttpResponseMessage,Router.Contracts.Domain.Account,Router.Contracts.Domain.PluginAttemptContext,System.Threading.CancellationToken)">
+            <summary>
+            逐行读取上游 SSE `data:` 消息并转换为宿主 StreamChunk；
+            流结束时释放上游响应，遇到 `[DONE]` 时输出标准结束原因。
+            </summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.BuildChatRequestBody(Router.Contracts.Domain.AdapterRequest,System.String)">
+            <summary>把宿主标准消息、工具和生成参数构造成 WorkBuddy Chat Completions 请求体。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.BuildTools(System.Collections.Generic.IReadOnlyList{System.Object})">
+            <summary>将宿主工具描述规整为上游支持的 function 工具结构并跳过无名称工具。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ApplyHeaders(System.Net.Http.HttpRequestMessage,Router.Contracts.Domain.OAuthCredential,System.Boolean,System.Boolean,System.Boolean,System.String)">
+            <summary>按国内/国际账号、请求用途和流模式构造 WorkBuddy 业务请求头。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.StableAccountId(System.String,System.String)">
+            <summary>为账号和用途生成稳定、不可直接反推出账号 ID 的机器/会话标识。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ApplyOAuthHeaders(System.Net.Http.HttpRequestMessage,System.String,System.String,System.String,Router.Contracts.Domain.OAuthCredential)">
+            <summary>构造 OAuth 接口所需的站点、User-Agent、Bearer/Refresh Token 和账号标识请求头。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ApplyConversationHeaders(System.Net.Http.HttpRequestMessage,Router.Contracts.Domain.PluginAttemptContext)">
+            <summary>将宿主追踪 ID 和可选对话 ID 映射为 WorkBuddy 会话追踪请求头。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.CreateDirectClient(System.Threading.CancellationToken)">
+            <summary>通过宿主 HTTP 客户端工厂创建用于账号管理类直连调用的客户端。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.FetchV3ModelsAsync(System.Net.Http.HttpClient,Router.Contracts.Domain.OAuthCredential,System.String,System.Threading.CancellationToken)">
+            <summary>从 WorkBuddy V3 配置接口按指定客户端 UA 发现模型和模型能力。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.FetchCliModelsAsync(System.Net.Http.HttpClient,Router.Contracts.Domain.OAuthCredential,System.String,System.Boolean,System.Threading.CancellationToken)">
+            <summary>按指定路径读取企业模型目录，可选择按 CLI agent 声明过滤模型。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.FetchGlobalCliModelsAsync(System.Net.Http.HttpClient,Router.Contracts.Domain.OAuthCredential,System.Threading.CancellationToken)">
+            <summary>国际站企业模型目录优先读新版 /v2 路径；失败或空列表时回退旧 /console 路径。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ParseModels(System.Text.Json.Nodes.JsonNode,System.Boolean)">
+            <summary>
+            解析并过滤上游模型：排除禁用、补全类、图片生成或输出上限过低的模型，
+            并提取上下文、输入/输出上限和推理能力。
+            </summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ToAccountView(Router.Contracts.Domain.Account)">
+            <summary>构造管理页面账号 DTO，只返回令牌元数据和已缓存积分，不暴露 OAuth Token。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ParseBalance(System.Text.Json.Nodes.JsonNode)">
+            <summary>汇总未过期积分包的余额与明细；周期剩余优先于账号级剩余。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadCreditPackageExpiry(System.Text.Json.Nodes.JsonObject)">
+            <summary>积分包在周期或套餐有效期中较早的时间失效；无有效日期时不推测有效期。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ToModelView(Router.Contracts.Domain.ModelDescriptor)">
+            <summary>将模型目录项投影为管理页面需要的稳定 JSON 字段。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.Error(Router.Contracts.Host.PluginHttpContext,System.Int32,System.String)">
+            <summary>构造统一的 JSON 错误响应，正文格式为 `{ error }`。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.CleanupPendingLogins">
+            <summary>删除超过 OAuth 登录有效期的待完成 state，避免登录状态字典持续增长。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.HasUsableToken(Router.Contracts.Domain.OAuthCredential)">
+            <summary>凭据至少包含访问令牌或刷新令牌时视为可供请求或续期使用。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.RealmFor(Router.Contracts.Domain.OAuthCredential)">
+            <summary>根据 OAuth 凭据域名返回对应 OAuth 站点标识。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.IsGlobal(Router.Contracts.Domain.OAuthCredential)">
+            <summary>判断凭据域名是否属于 WorkBuddy 国际站。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.BaseFor(Router.Contracts.Domain.OAuthCredential)">
+            <summary>根据账号所属站点选择聊天和模型 API 根地址。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.BillingBaseFor(Router.Contracts.Domain.OAuthCredential)">
+            <summary>根据账号所属站点选择套餐/余额 API 根地址。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.BillingResourcePathFor(Router.Contracts.Domain.OAuthCredential)">
+            <summary>返回国内或国际站的资源额度查询路径。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.DailyCheckinPathFor(Router.Contracts.Domain.OAuthCredential)">
+            <summary>返回账号所属站点的每日签到接口路径。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReportPathFor(Router.Contracts.Domain.OAuthCredential)">
+            <summary>返回账号所属站点的活跃报告接口路径。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.BaseForRealm(System.String)">
+            <summary>从 OAuth 流程显式选择的 `cn`/`global` realm 解析授权服务根地址。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.NormalizeModel(System.String)">
+            <summary>移除宿主模型标识中的可选平台名前缀，保留上游原始模型 ID。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.NormalizeDomain(System.String)">
+            <summary>将 OAuth 返回的 URL 或裸域名规范化为仅包含主机名的值。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.NormalizeTraceId(System.String)">
+            <summary>将追踪 ID 规整为 16/32 位小写十六进制；不符合格式时生成新的 ID。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.IsSafeAccountId(System.String)">
+            <summary>限制来自 OAuth 上游的账号 ID 长度和字符集，避免保存异常标识。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadBodyString(System.Object,System.String)">
+            <summary>从宿主 JSON 请求体读取指定字段，兼容字符串和可转成文本的简单 JSON 值。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ToJsonNode(System.Object)">
+            <summary>将插件契约对象转换为可编辑 JSON 节点；已有 JSON 节点会先深复制。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadNodeString(System.Text.Json.Nodes.JsonNode,System.String[])">
+            <summary>从 JSON 对象按候选字段顺序读取第一个存在的值文本。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadNodeLong(System.Text.Json.Nodes.JsonNode,System.String[])">
+            <summary>将候选 JSON 字段文本解析为 64 位整数。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadNodeDecimal(System.Text.Json.Nodes.JsonNode,System.String[])">
+            <summary>积分允许小数及数字字符串，避免将小数余额误读为零。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadNodeBoolean(System.Text.Json.Nodes.JsonNode,System.String[])">
+            <summary>将候选 JSON 字段解析为布尔值；无法识别时返回空值。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.TryReadInt(System.Text.Json.Nodes.JsonObject,System.String,System.Int32@)">
+            <summary>尝试从 JSON 对象的指定属性读取 32 位整数。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ParseJsonOrText(System.String)">
+            <summary>优先将响应正文解析为 JSON；正文不是 JSON 时将原文本包装为 JSON 字符串。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.SseData(System.String)">
+            <summary>提取 SSE `data:` 行的有效负载；其他字段行和注释行返回空值。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.FirstChoice(System.Text.Json.Nodes.JsonNode)">
+            <summary>读取聊天完成响应的第一个 choice；空数组或格式不符时返回空值。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadUsage(System.Text.Json.Nodes.JsonNode)">
+            <summary>读取 OpenAI 兼容 usage 的 prompt、completion 和 total token 数。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadToolCallDeltas(System.Text.Json.Nodes.JsonNode)">
+            <summary>读取标准工具调用增量或旧式 function_call，并统一转换为宿主工具增量类型。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadToolCallDelta(System.Text.Json.Nodes.JsonNode,System.Int32)">
+            <summary>解析单个工具调用片段，缺少显式 index 时使用其在数组中的位置。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadTaskCount(System.Text.Json.Nodes.JsonObject,System.String)">
+            <summary>读取成长任务平铺或 progress 对象中的次数字段。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadTaskCodes(System.Text.Json.Nodes.JsonNode)">
+            <summary>筛选尚未锁定、接受或领取的成长任务，并返回去重后的任务代码。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.TierStatus(System.Text.Json.Nodes.JsonObject,System.String)">
+            <summary>根据 7d、14d 或 28d 档位读取对应的连登奖励状态。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ReadClaimableTaskCodes(System.Text.Json.Nodes.JsonNode)">
+            <summary>筛选已完成但尚未领取的任务，并返回可尝试领取的去重任务代码。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ToInt(System.Int64)">
+            <summary>将 64 位计数安全收窄为 32 位值，并在越界时饱和到边界。</summary>
+        </member>
+        <member name="T:Plugins.WorkBuddy.WorkBuddyTerminal.PendingLogin">
+            <summary>尚未完成的 OAuth 流程状态及其创建时间和目标站点。</summary>
+            <param name="CreatedAt">插件创建并缓存该 state 的 UTC 时间。</param>
+            <param name="Realm">授权所用站点，值为规范化后的 cn 或 global。</param>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.PendingLogin.#ctor(System.DateTimeOffset,System.String)">
+            <summary>尚未完成的 OAuth 流程状态及其创建时间和目标站点。</summary>
+            <param name="CreatedAt">插件创建并缓存该 state 的 UTC 时间。</param>
+            <param name="Realm">授权所用站点，值为规范化后的 cn 或 global。</param>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.PendingLogin.CreatedAt">
+            <summary>插件创建并缓存该 state 的 UTC 时间。</summary>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.PendingLogin.Realm">
+            <summary>授权所用站点，值为规范化后的 cn 或 global。</summary>
+        </member>
+        <member name="T:Plugins.WorkBuddy.WorkBuddyTerminal.UpstreamResult">
+            <summary>统一封装上游 JSON 结果、HTTP 状态、可读消息和业务成功标志。</summary>
+            <param name="StatusCode">上游返回的 HTTP 状态码。</param>
+            <param name="Data">解包后的业务数据节点；无效或缺失时为空。</param>
+            <param name="Message">业务消息或未解析的原始响应文本。</param>
+            <param name="Success">HTTP 和上游业务码是否均表示成功。</param>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.UpstreamResult.#ctor(System.Int32,System.Text.Json.Nodes.JsonNode,System.String,System.Boolean)">
+            <summary>统一封装上游 JSON 结果、HTTP 状态、可读消息和业务成功标志。</summary>
+            <param name="StatusCode">上游返回的 HTTP 状态码。</param>
+            <param name="Data">解包后的业务数据节点；无效或缺失时为空。</param>
+            <param name="Message">业务消息或未解析的原始响应文本。</param>
+            <param name="Success">HTTP 和上游业务码是否均表示成功。</param>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.UpstreamResult.StatusCode">
+            <summary>上游返回的 HTTP 状态码。</summary>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.UpstreamResult.Data">
+            <summary>解包后的业务数据节点；无效或缺失时为空。</summary>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.UpstreamResult.Message">
+            <summary>业务消息或未解析的原始响应文本。</summary>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.UpstreamResult.Success">
+            <summary>HTTP 和上游业务码是否均表示成功。</summary>
+        </member>
+        <member name="T:Plugins.WorkBuddy.WorkBuddyTerminal.ModelFetchResult">
+            <summary>保留模型目录接口的成功状态，避免把鉴权失败误缓存为空模型列表。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.ModelFetchResult.#ctor(System.Boolean,System.Int32,Router.Contracts.Domain.ModelDescriptor[])">
+            <summary>保留模型目录接口的成功状态，避免把鉴权失败误缓存为空模型列表。</summary>
+        </member>
+        <member name="T:Plugins.WorkBuddy.WorkBuddyTerminal.CreditPackageSnapshot">
+            <summary>积分条中一个真实积分包的可用积分、已用积分、总量及有效期。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.CreditPackageSnapshot.#ctor(System.String,System.Decimal,System.Decimal,System.Decimal,System.Nullable{System.DateTimeOffset})">
+            <summary>积分条中一个真实积分包的可用积分、已用积分、总量及有效期。</summary>
+        </member>
+        <member name="T:Plugins.WorkBuddy.WorkBuddyTerminal.BalanceSnapshot">
+            <summary>单个账号最近一次余额刷新得到的套餐容量快照。</summary>
+            <param name="Remain">所有套餐剩余容量之和。</param>
+            <param name="Used">所有套餐已用容量之和。</param>
+            <param name="Size">所有套餐容量总和。</param>
+            <param name="Packages">上游返回并纳入汇总的套餐数量。</param>
+            <param name="UpdatedAt">最近一次成功数据的时间；首次失败时为失败快照创建时间。</param>
+            <param name="Error">刷新失败原因；成功快照为空。</param>
+            <param name="PackageDetails">用于按积分占比展示条纹和到期提示的积分包明细。</param>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.BalanceSnapshot.#ctor(System.Nullable{System.Decimal},System.Nullable{System.Decimal},System.Nullable{System.Decimal},System.Nullable{System.Int32},System.DateTimeOffset,System.String,Plugins.WorkBuddy.WorkBuddyTerminal.CreditPackageSnapshot[])">
+            <summary>单个账号最近一次余额刷新得到的套餐容量快照。</summary>
+            <param name="Remain">所有套餐剩余容量之和。</param>
+            <param name="Used">所有套餐已用容量之和。</param>
+            <param name="Size">所有套餐容量总和。</param>
+            <param name="Packages">上游返回并纳入汇总的套餐数量。</param>
+            <param name="UpdatedAt">最近一次成功数据的时间；首次失败时为失败快照创建时间。</param>
+            <param name="Error">刷新失败原因；成功快照为空。</param>
+            <param name="PackageDetails">用于按积分占比展示条纹和到期提示的积分包明细。</param>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.BalanceSnapshot.Remain">
+            <summary>所有套餐剩余容量之和。</summary>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.BalanceSnapshot.Used">
+            <summary>所有套餐已用容量之和。</summary>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.BalanceSnapshot.Size">
+            <summary>所有套餐容量总和。</summary>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.BalanceSnapshot.Packages">
+            <summary>上游返回并纳入汇总的套餐数量。</summary>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.BalanceSnapshot.UpdatedAt">
+            <summary>最近一次成功数据的时间；首次失败时为失败快照创建时间。</summary>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.BalanceSnapshot.Error">
+            <summary>刷新失败原因；成功快照为空。</summary>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.BalanceSnapshot.PackageDetails">
+            <summary>用于按积分占比展示条纹和到期提示的积分包明细。</summary>
+        </member>
+        <member name="P:Plugins.WorkBuddy.WorkBuddyTerminal.BalanceSnapshot.LastAttemptAt">
+            <summary>最近一次查询尝试的时间；失败退避不能延长旧数据的优先排序有效期。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.BalanceSnapshot.WithoutExpiredPackages(System.DateTimeOffset)">
+            <summary>移除已到期积分包并重算余额和明细；缓存读取时也检查，不延长数据新鲜度。</summary>
+            <param name="now">本次判断使用的时间；到期时间等于此时也视为过期。</param>
+            <returns>无过期包时返回原快照，否则返回保留原时间和错误信息的新快照。</returns>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyTerminal.BalanceSnapshot.Failed(System.String)">
+            <summary>创建保留失败时间和错误原因、但不伪造余额值的快照。</summary>
+        </member>
+        <member name="T:Plugins.WorkBuddy.WorkBuddyJsonNodeExtensions">
+            <summary>用于安全检查可选 JSON 节点类型的内部扩展方法。</summary>
+        </member>
+        <member name="M:Plugins.WorkBuddy.WorkBuddyJsonNodeExtensions.GetValueKindSafe(System.Text.Json.Nodes.JsonNode)">
+            <summary>返回 JsonValue 实际承载的 JSON 类型；其他节点返回 Object，空节点返回 Null。</summary>
+        </member>
+    </members>
+</doc>
