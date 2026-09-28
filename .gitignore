@@ -8,3 +8,6 @@ upstream/
 *.log
 *.pid
 .DS_Store
+
+# JoyCode 插件（按用户要求不入库，仅本地保留）
+joycode-plugin/

@@ -1,8 +1,0 @@
-{
-  "schemaVersion": 1,
-  "id": "joycode",
-  "name": "JoyCode",
-  "description": "将 JoyCode（京东 AI 编程助手）的多模型账号接入 Router2API，支持 GLM-5.1/5/4.7、Kimi-K2.6/2.5、MiniMax-M2.7、Doubao-Seed-2.0-pro、Claude-Opus-4.7 等模型。",
-  "runtime": "dotnet",
-  "version": "1.0.0"
-}
