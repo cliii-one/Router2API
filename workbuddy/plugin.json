@@ -1,8 +1,0 @@
-{
-  "schemaVersion": 1,
-  "id": "workbuddy",
-  "name": "WorkBuddy",
-  "description": "WorkBuddy 插件，反代出workbuddy的api 供第三方使用",
-  "runtime": "dotnet",
-  "version": "2.0.1.0"
-}
